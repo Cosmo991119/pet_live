@@ -1,0 +1,9 @@
+.DS_Store
+.pycache/
+__pycache__/
+*.pyc
+.env
+*.db
+chroma_db/
+static/generated/
+logs/

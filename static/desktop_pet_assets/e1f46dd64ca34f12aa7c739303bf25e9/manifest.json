@@ -1,0 +1,45 @@
+{
+  "character_id": "e1f46dd64ca34f12aa7c739303bf25e9",
+  "format": "gif-first",
+  "canvas": {
+    "width": 256,
+    "height": 256,
+    "background": "transparent"
+  },
+  "anchor": {
+    "x": 128,
+    "y": 228
+  },
+  "source_image_url": "/static/generated/64993b6f937e443894ad6de2f2717914.png",
+  "avatar": "avatar.png",
+  "animations": {
+    "idle": {
+      "type": "gif",
+      "src": "idle.gif"
+    },
+    "walk_right": {
+      "type": "gif",
+      "src": "walk_right.gif"
+    },
+    "walk_left": {
+      "type": "gif",
+      "src": "walk_left.gif"
+    },
+    "sleep": {
+      "type": "gif",
+      "src": "sleep.gif"
+    },
+    "happy": {
+      "type": "gif",
+      "src": "happy.gif"
+    },
+    "work": {
+      "type": "gif",
+      "src": "work.gif"
+    },
+    "alert": {
+      "type": "gif",
+      "src": "alert.gif"
+    }
+  }
+}

@@ -1,0 +1,67 @@
+[
+  {
+    "id": "8dd05b49b71546e1b3475682f482f69b",
+    "image_url": "/static/generated/6a49ddc89e224462ba919f1472a4b599.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "测试虎斑猫角色",
+    "created_at": "2026-05-07T19:16:48Z"
+  },
+  {
+    "id": "0e3559da0ea9421b89da15abc4fd17da",
+    "image_url": "/static/generated/06b33aadd89a4ab2928354a4db4d442b.png",
+    "style_mode": "character_pixel_2d",
+    "description": "左边橙发章鱼女孩像素角色，橙发紫眼，黑色上衣，紫色裙子，粉色触手下半身，拿手机",
+    "created_at": "2026-05-08T09:24:24Z"
+  },
+  {
+    "id": "7e523856ccde4e3f92653f63c51c1062",
+    "image_url": "/static/generated/7893a18640314c34af902fbdd546d871.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "左边的章鱼作为形象",
+    "created_at": "2026-05-11T10:12:07Z"
+  },
+  {
+    "id": "4f41589671cb402b9612590029bf7277",
+    "image_url": "/static/generated/7893a18640314c34af902fbdd546d871.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "左边的章鱼作为形象",
+    "created_at": "2026-05-11T10:12:10Z"
+  },
+  {
+    "id": "657b2a2e8c1249699f7cf64ef3b13c97",
+    "image_url": "/static/generated/7893a18640314c34af902fbdd546d871.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "左边的章鱼作为形象",
+    "created_at": "2026-05-11T10:12:37Z"
+  },
+  {
+    "id": "d0957821d3d74c3baa5b1d3343d0d647",
+    "image_url": "/static/generated/8ab34aff19d74567b0e56ebb19c13d4c.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "左边的章鱼作为形象",
+    "created_at": "2026-05-11T10:55:56Z",
+    "desktop_pet_manifest_url": "/static/desktop_pet_assets/d0957821d3d74c3baa5b1d3343d0d647/manifest.json",
+    "desktop_pet_asset_dir": "/static/desktop_pet_assets/d0957821d3d74c3baa5b1d3343d0d647",
+    "desktop_pet_avatar_url": "/static/desktop_pet_assets/d0957821d3d74c3baa5b1d3343d0d647/avatar.png"
+  },
+  {
+    "id": "459356ff5ec64941a15d1884c16b97cf",
+    "image_url": "/static/generated/b36cc8a279564a45ac04aea9a047bbcb.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "Telegram avatar confirmation smoke test from trace avatar_2bcf330248",
+    "created_at": "2026-05-11T12:13:34Z",
+    "desktop_pet_manifest_url": "/static/desktop_pet_assets/459356ff5ec64941a15d1884c16b97cf/manifest.json",
+    "desktop_pet_asset_dir": "/static/desktop_pet_assets/459356ff5ec64941a15d1884c16b97cf",
+    "desktop_pet_avatar_url": "/static/desktop_pet_assets/459356ff5ec64941a15d1884c16b97cf/avatar.png"
+  },
+  {
+    "id": "e1f46dd64ca34f12aa7c739303bf25e9",
+    "image_url": "/static/generated/64993b6f937e443894ad6de2f2717914.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "章鱼宠物，2D 像素风，单个正立角色，保留参考图的主色和气质，适合桌面宠物。",
+    "created_at": "2026-05-11T13:17:24Z",
+    "desktop_pet_manifest_url": "/static/desktop_pet_assets/e1f46dd64ca34f12aa7c739303bf25e9/manifest.json",
+    "desktop_pet_asset_dir": "/static/desktop_pet_assets/e1f46dd64ca34f12aa7c739303bf25e9",
+    "desktop_pet_avatar_url": "/static/desktop_pet_assets/e1f46dd64ca34f12aa7c739303bf25e9/avatar.png"
+  }
+]

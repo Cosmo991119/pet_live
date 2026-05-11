@@ -1,0 +1,41 @@
+第一步：直觉理解（必看）
+                                                                                                                                   
+  Jay Alammar 的可视化博客（最好的入门）                    
+  - The Illustrated Word2Vec — 搜 "illustrated word2vec" site:jalammar.github.io                                                   
+  - The Illustrated BERT — 搜 "illustrated bert" site:jalammar.github.io                                                           
+                                                                                                                                   
+  全程图解，不需要数学基础，你能看懂。                                                                                             
+                                                                                                                                   
+  ---
+  第二步：论文（按顺序读）                                                                                                         
+                                                            
+  1. Word2Vec（起点，2013）
+                                                                                                                                   
+  ▎ "Efficient Estimation of Word Representations in Vector Space"
+  ▎ Mikolov et al. — 搜论文标题找 arXiv 原文                                                                                       
+                                                                                                                                   
+  词嵌入的开山之作，解释为什么 king - man + woman = queen。                                                                        
+                                                                                                                                   
+  2. Attention is All You Need（核心，2017）                                                                                       
+                                                            
+  ▎ Vaswani et al. — arXiv:1706.03762                                                                                              
+  
+  你用的嵌入模型底层都是 Transformer，这篇是根基。                                                                                 
+                                                            
+  3. Sentence-BERT（你代码直接用的，2019）                                                                                         
+                                                            
+  ▎ "Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks"                                                               
+  ▎ Reimers & Gurevych — arXiv:1908.10084                   
+                                                                                                                                   
+  就是 sentence-transformers 这个库的论文。                                                                                        
+                                                                                                                                   
+  ---                                                                                                                              
+  学习顺序建议                                              
+
+  Jay Alammar Word2Vec 博客
+      ↓                                                                                                                            
+  Jay Alammar BERT 博客
+      ↓                                                                                                                            
+  Sentence-BERT 论文（Abstract + Introduction 就够）        
+      ↓                                                                                                                            
+  （选修）Attention is All You Need

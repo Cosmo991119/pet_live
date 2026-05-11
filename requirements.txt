@@ -1,0 +1,9 @@
+anthropic
+chromadb
+fastapi
+openai
+python-multipart
+python-dotenv
+requests
+sentence-transformers
+uvicorn

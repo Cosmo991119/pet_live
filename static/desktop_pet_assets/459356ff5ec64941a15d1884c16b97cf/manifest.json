@@ -1,0 +1,175 @@
+{
+  "character_id": "459356ff5ec64941a15d1884c16b97cf",
+  "format": "behavior-pose-gif",
+  "canvas": {
+    "width": 256,
+    "height": 256,
+    "background": "transparent"
+  },
+  "anchor": {
+    "x": 128,
+    "y": 228
+  },
+  "source_image_url": "/static/generated/b36cc8a279564a45ac04aea9a047bbcb.png",
+  "avatar": "avatar.png",
+  "pose_sources": {
+    "avatar": {
+      "src": "avatar.png",
+      "source": "confirmed_character"
+    },
+    "idle": {
+      "src": "idle_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "standing calmly in a relaxed idle pose, breathing gently, full body visible"
+    },
+    "relax": {
+      "src": "relax_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "lounging lazily in a cozy relaxed pose, peaceful and idle, full body visible"
+    },
+    "walk_right": {
+      "src": "walk_right_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "walking toward the right, one foot forward, lively side-step pose, full body visible"
+    },
+    "walk_left": {
+      "src": "walk_left_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "walking toward the left, one foot forward, lively side-step pose, full body visible"
+    },
+    "sleep": {
+      "src": "sleep_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "sleeping curled up or lying down comfortably, eyes closed, unmistakable sleep pose"
+    },
+    "happy": {
+      "src": "happy_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "very happy celebratory pose, smiling brightly, excited cute expression"
+    },
+    "work": {
+      "src": "work_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "focused work-helper pose, concentrating with a tiny laptop or notebook prop"
+    },
+    "alert": {
+      "src": "alert_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "alert attention pose, surprised eyes, ready to notify the owner"
+    },
+    "feed": {
+      "src": "feed_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "eating happily from a small bowl, food action immediately readable"
+    },
+    "refill": {
+      "src": "refill_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "drinking water or reaching toward a small water bowl, thirst action immediately readable"
+    },
+    "play": {
+      "src": "play_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "playing energetically with a small toy, playful motion pose, full body visible"
+    },
+    "pet": {
+      "src": "pet_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "being petted and enjoying it, affectionate happy pose, full body visible"
+    },
+    "clean": {
+      "src": "clean_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "getting cleaned or sparkling after cleaning, fresh tidy pose, full body visible"
+    },
+    "lullaby": {
+      "src": "lullaby_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "drowsy and being soothed to sleep, sleepy eyes, cozy bedtime pose"
+    }
+  },
+  "animations": {
+    "idle": {
+      "type": "gif",
+      "src": "idle.gif",
+      "pose": "idle_pose.png"
+    },
+    "relax": {
+      "type": "gif",
+      "src": "relax.gif",
+      "pose": "relax_pose.png"
+    },
+    "walk_right": {
+      "type": "gif",
+      "src": "walk_right.gif",
+      "pose": "walk_right_pose.png"
+    },
+    "walk_left": {
+      "type": "gif",
+      "src": "walk_left.gif",
+      "pose": "walk_left_pose.png"
+    },
+    "sleep": {
+      "type": "gif",
+      "src": "sleep.gif",
+      "pose": "sleep_pose.png"
+    },
+    "happy": {
+      "type": "gif",
+      "src": "happy.gif",
+      "pose": "happy_pose.png"
+    },
+    "work": {
+      "type": "gif",
+      "src": "work.gif",
+      "pose": "work_pose.png"
+    },
+    "alert": {
+      "type": "gif",
+      "src": "alert.gif",
+      "pose": "alert_pose.png"
+    },
+    "feed": {
+      "type": "gif",
+      "src": "feed.gif",
+      "pose": "feed_pose.png"
+    },
+    "refill": {
+      "type": "gif",
+      "src": "refill.gif",
+      "pose": "refill_pose.png"
+    },
+    "play": {
+      "type": "gif",
+      "src": "play.gif",
+      "pose": "play_pose.png"
+    },
+    "pet": {
+      "type": "gif",
+      "src": "pet.gif",
+      "pose": "pet_pose.png"
+    },
+    "clean": {
+      "type": "gif",
+      "src": "clean.gif",
+      "pose": "clean_pose.png"
+    },
+    "lullaby": {
+      "type": "gif",
+      "src": "lullaby.gif",
+      "pose": "lullaby_pose.png"
+    }
+  },
+  "action_animation_map": {
+    "feed": "feed",
+    "refill": "refill",
+    "play": "play",
+    "pet": "pet",
+    "clean": "clean",
+    "lullaby": "lullaby",
+    "sleep": "sleep",
+    "work": "work",
+    "relax": "relax",
+    "idle": "idle"
+  }
+}
