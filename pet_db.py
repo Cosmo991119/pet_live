@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import date, datetime, time, timedelta
 import json
 import os
+import secrets
 import sqlite3
 from typing import Any, Optional, Union
 
@@ -433,6 +434,56 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
             CREATE INDEX IF NOT EXISTS idx_pet_relationships_to_pet
             ON pet_relationships (to_pet_id);
 
+            CREATE TABLE IF NOT EXISTS pet_friendship_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL UNIQUE,
+                inviter_owner_id INTEGER NOT NULL,
+                inviter_pet_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    status IN ('pending', 'accepted', 'expired', 'cancelled')
+                ),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (inviter_owner_id) REFERENCES owners(id),
+                FOREIGN KEY (inviter_pet_id) REFERENCES pets(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pet_friendship_invites_owner
+            ON pet_friendship_invites (inviter_owner_id, status);
+
+            CREATE TABLE IF NOT EXISTS pet_friendships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pet_a_id INTEGER NOT NULL,
+                pet_b_id INTEGER NOT NULL,
+                owner_a_id INTEGER NOT NULL,
+                owner_b_id INTEGER NOT NULL,
+                affinity INTEGER NOT NULL DEFAULT 50 CHECK (
+                    affinity >= 0 AND affinity <= 100
+                ),
+                status TEXT NOT NULL DEFAULT 'active' CHECK (
+                    status IN ('active', 'blocked')
+                ),
+                muted INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+                created_from_invite_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK (pet_a_id != pet_b_id),
+                CHECK (owner_a_id != owner_b_id),
+                UNIQUE (pet_a_id, pet_b_id),
+                FOREIGN KEY (pet_a_id) REFERENCES pets(id),
+                FOREIGN KEY (pet_b_id) REFERENCES pets(id),
+                FOREIGN KEY (owner_a_id) REFERENCES owners(id),
+                FOREIGN KEY (owner_b_id) REFERENCES owners(id),
+                FOREIGN KEY (created_from_invite_id) REFERENCES pet_friendship_invites(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pet_friendships_owner_a
+            ON pet_friendships (owner_a_id, status);
+
+            CREATE INDEX IF NOT EXISTS idx_pet_friendships_owner_b
+            ON pet_friendships (owner_b_id, status);
+
             CREATE TABLE IF NOT EXISTS pet_memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 memory_type TEXT NOT NULL CHECK (
@@ -613,10 +664,38 @@ def _relationship_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
+def _friendship_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_to_dict(row)
+    if "muted" in data:
+        data["muted"] = bool(data["muted"])
+    return data
+
+
 def _ensure_pet_exists(conn: sqlite3.Connection, pet_id: int, field_name: str) -> None:
     pet = conn.execute("SELECT id FROM pets WHERE id = ?", (pet_id,)).fetchone()
     if pet is None:
         raise ValueError(f"{field_name} {pet_id} does not exist")
+
+
+def _pet_owner_id(conn: sqlite3.Connection, pet_id: int, field_name: str) -> int:
+    row = conn.execute(
+        "SELECT owner_id FROM pets WHERE id = ?",
+        (pet_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"{field_name} {pet_id} does not exist")
+    return int(row["owner_id"])
+
+
+def _ordered_friendship_pair(
+    first_pet_id: int,
+    first_owner_id: int,
+    second_pet_id: int,
+    second_owner_id: int,
+) -> tuple[int, int, int, int]:
+    if int(first_pet_id) <= int(second_pet_id):
+        return int(first_pet_id), int(second_pet_id), int(first_owner_id), int(second_owner_id)
+    return int(second_pet_id), int(first_pet_id), int(second_owner_id), int(first_owner_id)
 
 
 def create_pet(
@@ -964,6 +1043,193 @@ def delete_pet_relationship(
             (from_pet_id, to_pet_id),
         )
     return _relationship_row_to_dict(row)
+
+
+def create_pet_friendship_invite(
+    inviter_owner_id: int,
+    inviter_pet_id: int,
+    token: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Create a short-lived cross-owner pet friendship invite."""
+    token_value = str(token or secrets.token_urlsafe(12)).strip()
+    if not token_value:
+        raise ValueError("token cannot be empty")
+    expires = expires_at or (datetime.utcnow() + timedelta(days=7)).isoformat(timespec="seconds")
+
+    with connect(db_path) as conn:
+        _resolve_owner_id(conn, int(inviter_owner_id))
+        pet_owner_id = _pet_owner_id(conn, int(inviter_pet_id), "inviter_pet_id")
+        if pet_owner_id != int(inviter_owner_id):
+            raise ValueError("inviter_pet_id does not belong to inviter_owner_id")
+        cursor = conn.execute(
+            """
+            INSERT INTO pet_friendship_invites (
+                token,
+                inviter_owner_id,
+                inviter_pet_id,
+                expires_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (token_value, inviter_owner_id, inviter_pet_id, expires),
+        )
+        row = conn.execute(
+            """
+            SELECT i.*, p.name AS inviter_pet_name, o.display_name AS inviter_owner_name
+            FROM pet_friendship_invites i
+            JOIN pets p ON p.id = i.inviter_pet_id
+            JOIN owners o ON o.id = i.inviter_owner_id
+            WHERE i.id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_pet_friendship_invite(
+    token: str,
+    db_path: DbPath = DB_PATH,
+) -> Optional[dict[str, Any]]:
+    """Return one friendship invite by token, or None if missing."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT i.*, p.name AS inviter_pet_name, o.display_name AS inviter_owner_name
+            FROM pet_friendship_invites i
+            JOIN pets p ON p.id = i.inviter_pet_id
+            JOIN owners o ON o.id = i.inviter_owner_id
+            WHERE i.token = ?
+            """,
+            (str(token).strip(),),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def _friendship_select_sql(where_sql: str = "") -> str:
+    return f"""
+        SELECT
+            f.*,
+            pa.name AS pet_a_name,
+            pb.name AS pet_b_name,
+            oa.display_name AS owner_a_name,
+            ob.display_name AS owner_b_name,
+            i.status AS invite_status
+        FROM pet_friendships f
+        JOIN pets pa ON pa.id = f.pet_a_id
+        JOIN pets pb ON pb.id = f.pet_b_id
+        JOIN owners oa ON oa.id = f.owner_a_id
+        JOIN owners ob ON ob.id = f.owner_b_id
+        LEFT JOIN pet_friendship_invites i ON i.id = f.created_from_invite_id
+        {where_sql}
+    """
+
+
+def accept_pet_friendship_invite(
+    token: str,
+    receiver_owner_id: int,
+    receiver_pet_id: int,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Accept a pending invite and create or return the active friendship."""
+    token_value = str(token).strip()
+    if not token_value:
+        raise ValueError("token is required")
+
+    with connect(db_path) as conn:
+        invite = conn.execute(
+            "SELECT * FROM pet_friendship_invites WHERE token = ?",
+            (token_value,),
+        ).fetchone()
+        if invite is None:
+            raise ValueError("friendship invite does not exist")
+        if invite["status"] != "pending":
+            raise ValueError("friendship invite is not pending")
+        expires_at = datetime.fromisoformat(str(invite["expires_at"]))
+        if expires_at < datetime.utcnow():
+            conn.execute(
+                """
+                UPDATE pet_friendship_invites
+                SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (invite["id"],),
+            )
+            raise ValueError("friendship invite has expired")
+
+        _resolve_owner_id(conn, int(receiver_owner_id))
+        receiver_pet_owner_id = _pet_owner_id(conn, int(receiver_pet_id), "receiver_pet_id")
+        if receiver_pet_owner_id != int(receiver_owner_id):
+            raise ValueError("receiver_pet_id does not belong to receiver_owner_id")
+        inviter_owner_id = int(invite["inviter_owner_id"])
+        inviter_pet_id = int(invite["inviter_pet_id"])
+        if inviter_owner_id == int(receiver_owner_id):
+            raise ValueError("pet friendships require two different owners")
+        pet_a_id, pet_b_id, owner_a_id, owner_b_id = _ordered_friendship_pair(
+            inviter_pet_id,
+            inviter_owner_id,
+            int(receiver_pet_id),
+            int(receiver_owner_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO pet_friendships (
+                pet_a_id,
+                pet_b_id,
+                owner_a_id,
+                owner_b_id,
+                affinity,
+                status,
+                muted,
+                created_from_invite_id,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, 50, 'active', 0, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(pet_a_id, pet_b_id) DO UPDATE SET
+                status = 'active',
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (pet_a_id, pet_b_id, owner_a_id, owner_b_id, invite["id"]),
+        )
+        conn.execute(
+            """
+            UPDATE pet_friendship_invites
+            SET status = 'accepted', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (invite["id"],),
+        )
+        row = conn.execute(
+            _friendship_select_sql("WHERE f.pet_a_id = ? AND f.pet_b_id = ?"),
+            (pet_a_id, pet_b_id),
+        ).fetchone()
+    return _friendship_row_to_dict(row)
+
+
+def list_pet_friendships(
+    owner_id: Optional[int] = None,
+    pet_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> list[dict[str, Any]]:
+    """List active cross-owner pet friendships."""
+    clauses: list[str] = ["f.status = 'active'"]
+    params: list[Any] = []
+    if owner_id is not None:
+        clauses.append("(f.owner_a_id = ? OR f.owner_b_id = ?)")
+        params.extend([owner_id, owner_id])
+    if pet_id is not None:
+        clauses.append("(f.pet_a_id = ? OR f.pet_b_id = ?)")
+        params.extend([pet_id, pet_id])
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            _friendship_select_sql(where_sql)
+            + " ORDER BY f.created_at ASC, f.id ASC",
+            params,
+        ).fetchall()
+    return [_friendship_row_to_dict(row) for row in rows]
 
 
 def _normalize_memory_type(memory_type: str) -> str:

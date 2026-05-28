@@ -1,25 +1,32 @@
-**Current Objective**
+**User Goal**
 
-Commit the local project work since last night, including desktop pet behavior, Wan animation assets, and generation workflow changes.
+Continue `/Users/cosmos/agent-demo`, a Chinese Telegram + desktop AI pet companion. Current active discussion: locate and understand the project’s current prompts for GPT-generated desktop-pet walking images and GIF walking animation.
 
-**Latest Change**
+**Current State**
 
-- Updated walking generation so `walk_left` is produced by mirroring `walk_right` frames in `desktop_pet_assets.build_desktop_pet_assets(...)`.
-- Added regression coverage proving frame sequence generation only calls the provider for `walk_right`, then writes `walk_left` as the mirrored sequence with `pose_sources.walk_left.source = "mirrored_from_walk_right"`.
-- Also updated future walking prompts so soft-bodied mollusks crawl/glide with arms/tentacles and fish use tail-fin swimming instead of legs.
+- Desktop pet character images are confirmed in `characters/characters.json`; current relevant character `8bb2abb559984f83812153d08feede54` is the small octopus (`左边的小章鱼`) with `desktop_pet_asset_provider: "wan"` and `walking_reference_image_url: /static/generated/04df50041e0d4714b6562d02b21afff6.png`.
+- GPT walking-reference image generation is built in `character_agent._walking_reference_prompt(...)`, then called by `_generate_walking_reference_image(...)` during `create_character(...)` or before Wan walking asset generation when missing.
+- GPT desktop-pet behavior frame generation is built in `character_agent._desktop_frame_prompt(...)`; it receives the action short prompt from `desktop_pet_assets.ANIMATION_SPECS`.
+- The current GPT walk action snippets are in `desktop_pet_assets.py`:
+  - `walk_right`: `walking in place while facing right, one foot forward, lively step-cycle pose, full body visible`
+  - `walk_left`: `walking in place while facing left, one foot forward, lively step-cycle pose, full body visible`
+- Current default asset provider is Wan (`DESKTOP_PET_ASSET_PROVIDER` defaults to `wan`). For walk actions, `character_agent._generate_wan_desktop_behavior_frames(...)` uses the GPT walking reference image as Wan’s source image.
+- Wan’s walk GIF motion prompt is in `wan_video_agent.wan_prompt_for_animation(...)`; it includes species-aware rules for octopus/squid/soft-bodied mollusks: preserve tentacles, avoid human/mammal gait, and use alternating tentacle support, crawling, ground-hugging motion, or gentle gliding.
 
-**Current Desktop Pet Behavior**
+**Recent Change**
 
-- `desktop_pet_mac.swift` supports right-click `陪玩`: shows a small non-interactive lure overlay and makes the pet follow the mouse for about 18 seconds.
-- While chasing, it emits `walk_left` / `walk_right`; `PetView.tick(...)` maps those actions to the walking GIFs.
-- Sleep and idle manifest entries for Qing Qing use unique Wan full-video GIF filenames to avoid stale cache confusion.
+- Read the prompt pipeline and current generated manifest for the octopus desktop pet. No runtime/code changes were made.
+- Refreshed this handoff to make the walking prompt pipeline the current task context; older group-chat memory product rules remain archived in `CONTEXT.md`.
+
+**Artifact Trail**
+
+- Modified: `.agents/context-handoff.md`.
+- Important read-only context: `character_agent.py`, `desktop_pet_assets.py`, `wan_video_agent.py`, `image_style_agent.py`, `image_styles/animal_pixel_2d.py`, `image_styles/character_pixel_2d.py`, `characters/characters.json`, `static/desktop_pet_assets/8bb2abb559984f83812153d08feede54/manifest.json`.
 
 **Verification**
 
-- Ran `python3 -m unittest tests.test_desktop_pet_assets tests.test_character_sticker_pack tests.test_wan_video_agent`; passed, 27 tests.
-- Ran `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile desktop_pet_assets.py character_agent.py wan_video_agent.py`; passed.
-- Earlier Swift checks for `desktop_pet_mac.swift` passed with both `swiftc -parse` and full compile to `/private/tmp/desktop_pet_mac_check`.
+- Read-only prompt inspection plus handoff update; no tests run because no application behavior changed.
 
-**Working Tree Plan**
+**Next Recommended Step**
 
-User asked to commit local code after last night. Stage the current worktree and create one local commit on `main` unless redirected.
+If the desired walking style is octopus-like GPT crawling, update `desktop_pet_assets.ANIMATION_SPECS` walk prompts and/or `character_agent._desktop_frame_prompt(...)` walking-specific guidance to explicitly describe tentacle-supported crawling instead of generic `one foot forward` stepping.

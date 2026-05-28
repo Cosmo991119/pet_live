@@ -1247,3 +1247,43 @@ Implementation notes:
   local single-user demo behavior.
 - Friendship invites, friendship messages, delivery budgets, and cross-owner
   memory-sharing are still future slices built on this owner boundary.
+
+## Slice 44: Pet Friendship Invites V1
+
+Type: Cross-owner social graph / Telegram UX
+
+Blocked by: Slice 43
+
+What to build:
+
+Let one owner choose one of their pets and generate a short-lived friendship
+invite. Another approved owner can open the invite, choose one of their own pets,
+and accept. Only after acceptance does the system create an active cross-owner
+`pet_friendships` row.
+
+Acceptance criteria:
+
+- [x] Add `pet_friendship_invites` for owner-mediated invite tokens.
+- [x] Add `pet_friendships` for active cross-owner pet friendships with V1
+  `affinity` defaulting to 50.
+- [x] Reject invites for pets that do not belong to the inviter owner.
+- [x] Reject accepting an invite with a pet from the same owner.
+- [x] Accepting a pending invite creates or reuses an active friendship and
+  marks the invite accepted.
+- [x] API exposes create/get/accept invite endpoints and friendship listing.
+- [x] Telegram exposes a `宠物好友` entry point for generating an invite from one
+  of the owner's pets.
+- [x] Telegram supports `/pet_friend_invite <token>` for the receiving owner to
+  accept with one of their own pets.
+- [x] Tests cover DB constraints, API pass-through, and Telegram invite
+  generation/acceptance.
+
+Implementation notes:
+
+- Friendship invite tokens are generated server-side and expire after seven
+  days by default.
+- Telegram V1 shares the command `/pet_friend_invite <token>` as the invitation
+  handoff; a true Telegram deep link can be added later.
+- This slice creates the friendship graph only. Owner-directed sharing,
+  delivery budgets, mute/cooldown controls, and memory-share flows remain future
+  slices.
