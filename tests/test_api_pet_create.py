@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 from api import (
     CharacterStickerPackRequest,
+    PetFriendshipInviteAcceptRequest,
+    PetFriendshipInviteCreateRequest,
     PetCreateRequest,
     PetMemoryRequest,
     OwnerTelegramRequest,
@@ -10,12 +12,15 @@ from api import (
     PetRelationshipRequest,
     create_character_sticker_pack,
     create_character_desktop_assets,
+    accept_pet_friendship_invite_endpoint,
+    create_pet_friendship_invite_endpoint,
     create_pet_endpoint,
     create_pet_memory_endpoint,
     create_telegram_owner_endpoint,
     delete_pet_endpoint,
     delete_pet_relationship_endpoint,
     list_pet_memories_endpoint,
+    list_pet_friendships_endpoint,
     list_pet_relationships_endpoint,
     mute_pet_relationship_endpoint,
     upsert_pet_relationship_endpoint,
@@ -132,6 +137,45 @@ class ApiPetCreateTest(unittest.TestCase):
             from_pet_id=1,
             to_pet_id=2,
         )
+
+    @patch("api.create_pet_friendship_invite")
+    def test_create_friendship_invite_endpoint_passes_payload(self, create_invite) -> None:
+        create_invite.return_value = {"token": "friend-token"}
+        payload = PetFriendshipInviteCreateRequest(
+            inviter_owner_id=3,
+            inviter_pet_id=7,
+        )
+
+        result = create_pet_friendship_invite_endpoint(payload)
+
+        self.assertEqual({"token": "friend-token"}, result)
+        create_invite.assert_called_once_with(inviter_owner_id=3, inviter_pet_id=7)
+
+    @patch("api.accept_pet_friendship_invite")
+    def test_accept_friendship_invite_endpoint_passes_payload(self, accept_invite) -> None:
+        accept_invite.return_value = {"id": 9, "status": "active"}
+        payload = PetFriendshipInviteAcceptRequest(
+            receiver_owner_id=4,
+            receiver_pet_id=8,
+        )
+
+        result = accept_pet_friendship_invite_endpoint("friend-token", payload)
+
+        self.assertEqual({"id": 9, "status": "active"}, result)
+        accept_invite.assert_called_once_with(
+            token="friend-token",
+            receiver_owner_id=4,
+            receiver_pet_id=8,
+        )
+
+    @patch("api.list_pet_friendships")
+    def test_list_friendships_endpoint_passes_filters(self, list_friendships) -> None:
+        list_friendships.return_value = [{"id": 9}]
+
+        result = list_pet_friendships_endpoint(owner_id=3, pet_id=7)
+
+        self.assertEqual([{"id": 9}], result)
+        list_friendships.assert_called_once_with(owner_id=3, pet_id=7)
 
     @patch("api.set_pet_relationship_muted")
     def test_mute_relationship_endpoint_passes_payload(self, set_muted) -> None:

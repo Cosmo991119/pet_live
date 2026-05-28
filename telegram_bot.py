@@ -85,6 +85,7 @@ PENDING_SET_FIELDS: dict[str, dict[str, Any]] = {}
 PENDING_AVATAR_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_PET_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_RELATIONSHIP_FLOWS: dict[str, dict[str, Any]] = {}
+PENDING_FRIENDSHIP_INVITE_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_MEMORY_PHOTO_FLOWS: dict[str, dict[str, Any]] = {}
 CURRENT_PET_IDS: dict[str, int] = {}
 OWNER_IDS_BY_CHAT: dict[str, int] = {}
@@ -136,6 +137,7 @@ MAIN_REPLY_KEYBOARD = {
     "keyboard": [
         [{"text": "查看状态"}, {"text": "桌面陪伴"}],
         [{"text": "宠物列表"}, {"text": "宠物关系"}],
+        [{"text": "宠物好友"}],
         [{"text": "创建宠物"}],
         [{"text": "喂饭"}, {"text": "加水"}, {"text": "陪玩"}],
         [{"text": "摸摸"}, {"text": "清洁"}, {"text": "哄睡"}],
@@ -972,6 +974,133 @@ def handle_relationship_text(chat_id: str, text: str) -> bool:
         return False
     finish_relationship_flow(chat_id, text)
     return True
+
+
+def start_friendship_invite_flow(chat_id: str) -> None:
+    if not owner_scoping_enabled():
+        send_message(
+            chat_id,
+            "宠物好友需要先启用多主人 allowlist：TELEGRAM_ALLOWED_OWNER_CHAT_IDS。",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return
+    pets = api_get_pets(chat_id)
+    if not pets:
+        send_message(chat_id, "还没有宠物。先创建一只宠物，再生成好友邀请。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    rows = [[(str(pet["name"]), f"friend:invite_pet:{pet['id']}")] for pet in pets]
+    send_message(
+        chat_id,
+        "选择一只宠物生成好友邀请。对方打开邀请后，会选择 TA 自己的一只宠物确认。",
+        reply_markup=inline_keyboard(rows),
+    )
+
+
+def create_friendship_invite_for_pet(chat_id: str, pet_id: int) -> None:
+    owner_id = ensure_owner_id(chat_id)
+    if owner_id is None:
+        send_message(chat_id, "宠物好友需要先启用多主人 allowlist。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/pet-friendship-invites",
+            json={"inviter_owner_id": owner_id, "inviter_pet_id": pet_id},
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(response.text)
+    except (RuntimeError, requests.RequestException) as exc:
+        send_message(chat_id, f"好友邀请生成失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    invite = response.json()
+    token = invite["token"]
+    send_message(
+        chat_id,
+        (
+            f"{pet['name']} 的好友邀请生成好了。\n"
+            f"把这段发给对方主人：/pet_friend_invite {token}\n"
+            "对方确认后，两只宠物才会成为好友。"
+        ),
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+
+
+def handle_friendship_invite_command(chat_id: str, text: str) -> bool:
+    parts = text.strip().split(maxsplit=1)
+    if not parts or parts[0] not in {"/pet_friend_invite", "/friend"}:
+        return False
+    if len(parts) != 2 or not parts[1].strip():
+        send_message(chat_id, "请带上好友邀请码，比如：/pet_friend_invite abc123")
+        return True
+    token = parts[1].strip()
+    owner_id = ensure_owner_id(chat_id)
+    if owner_id is None:
+        send_message(chat_id, "宠物好友需要先启用多主人 allowlist。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    try:
+        invite_response = requests.get(
+            f"{API_BASE_URL}/pet-friendship-invites/{token}",
+            timeout=10,
+        )
+        if invite_response.status_code >= 400:
+            raise RuntimeError(invite_response.text)
+        invite = invite_response.json()
+        pets = api_get_pets(chat_id)
+    except (RuntimeError, requests.RequestException) as exc:
+        send_message(chat_id, f"读取好友邀请失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    if not pets:
+        send_message(chat_id, "你还没有宠物。先创建一只宠物，再接受好友邀请。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    if len(pets) == 1:
+        accept_friendship_invite_for_pet(chat_id, token, int(pets[0]["id"]))
+        return True
+    PENDING_FRIENDSHIP_INVITE_FLOWS[chat_id] = {"token": token, "step": "choose_receiver_pet"}
+    rows = [[(str(pet["name"]), f"friend:accept_pet:{pet['id']}")] for pet in pets]
+    send_message(
+        chat_id,
+        f"{invite.get('inviter_pet_name', '对方宠物')} 发来了好友邀请。选择你家哪只宠物接受？",
+        reply_markup=inline_keyboard(rows),
+    )
+    return True
+
+
+def accept_friendship_invite_for_pet(chat_id: str, token: str, pet_id: int) -> None:
+    owner_id = ensure_owner_id(chat_id)
+    if owner_id is None:
+        send_message(chat_id, "宠物好友需要先启用多主人 allowlist。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/pet-friendship-invites/{token}/accept",
+            json={"receiver_owner_id": owner_id, "receiver_pet_id": pet_id},
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(response.text)
+    except (RuntimeError, requests.RequestException) as exc:
+        send_message(chat_id, f"接受好友邀请失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    friendship = response.json()
+    PENDING_FRIENDSHIP_INVITE_FLOWS.pop(chat_id, None)
+    other_name = (
+        friendship.get("pet_a_name")
+        if int(friendship.get("pet_b_id")) == int(pet_id)
+        else friendship.get("pet_b_name")
+    )
+    send_message(
+        chat_id,
+        f"{pet['name']} 和 {other_name or '对方宠物'} 已经成为好友啦。",
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
 
 
 def build_relationship_context_for_candidates(
@@ -2840,6 +2969,23 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
     if data == "rel:start":
         start_relationship_flow(chat_id)
         return
+    if data == "friend:start":
+        start_friendship_invite_flow(chat_id)
+        return
+    if data.startswith("friend:invite_pet:"):
+        create_friendship_invite_for_pet(chat_id, int(data.rsplit(":", 1)[1]))
+        return
+    if data.startswith("friend:accept_pet:"):
+        flow = PENDING_FRIENDSHIP_INVITE_FLOWS.get(chat_id)
+        if not flow or not flow.get("token"):
+            send_message(chat_id, "当前没有等待接受的好友邀请。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+        accept_friendship_invite_for_pet(
+            chat_id,
+            str(flow["token"]),
+            int(data.rsplit(":", 1)[1]),
+        )
+        return
     if data.startswith("rel:source:"):
         choose_relationship_source(chat_id, int(data.rsplit(":", 1)[1]))
         return
@@ -2991,6 +3137,8 @@ def handle_message(message: dict[str, Any]) -> None:
         return
     if handle_relationship_text(chat_id, text):
         return
+    if handle_friendship_invite_command(chat_id, text):
+        return
     if handle_pending_text(chat_id, text):
         return
     if handle_avatar_style_text(chat_id, text):
@@ -3010,6 +3158,8 @@ def handle_message(message: dict[str, Any]) -> None:
         handle_pet_group_command(chat_id)
     elif text == "宠物关系":
         start_relationship_flow(chat_id)
+    elif text == "宠物好友":
+        start_friendship_invite_flow(chat_id)
     elif text == "创建宠物":
         start_pet_create_flow(chat_id)
     elif text == "设置资料":

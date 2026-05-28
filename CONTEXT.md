@@ -57,6 +57,33 @@ pet participants because participation controls who may recall a co-experienced
 memory as lived experience. Internal tombstones or revision metadata may exist
 for debugging and audit, but deleted content must not be shown to pet prompts.
 
+Pet memory recall should be low-frequency, topic-relevant, and cooled down per
+memory. `recallable` memories may be mentioned naturally when the current topic
+relates to them, but pets should not bring them up every turn. Recent or
+high-importance shared moments may be easier to recall for a short period, still
+with cooldown after use. `behavioral` memories should keep shaping speech and
+actions without being announced as remembered facts. `private` memories should
+not be proactively recalled and should only guide responses when the owner
+opens the related topic.
+
+Multi-pet group chat distinguishes knowledge from participation. A memory
+shared in the group chat may become something all pets know the owner said, but
+only explicitly named or owner-confirmed participant pets may treat it as a
+co-experienced memory. Non-participant pets may reference that they heard the
+owner talk about another pet's moment, but they must not claim they lived it.
+When the owner says broad wording such as "we" without naming pets, the system
+should ask which pets participated before writing a co-experienced memory.
+
+Memory capture should use confidence tiers. Explicit owner instructions such as
+"remember this", "from now on", or "do not do this again" may directly create or
+update durable memory, with a transparent confirmation. High-confidence,
+low-sensitivity preferences such as names, tone, or simple interaction
+boundaries may be saved with clear acknowledgement. Medium-confidence,
+low-confidence, or sensitive content should trigger a suggestion or confirmation
+question instead of silent persistence. Relationship inference, catchphrases,
+and co-experienced memories with unclear participants should accumulate evidence
+or ask a follow-up question before becoming durable memory.
+
 ### Shared Owner Memory
 
 A memory where the owner shares a real-life moment with the pets, such as a trip
@@ -160,6 +187,13 @@ topics, the pet should first ask for explicit long-term-memory confirmation in
 a gentle way. If confirmed, the memory should be marked sensitive and default to
 private visibility or an equivalent restricted recall mode. If not confirmed,
 the moment can be handled conversationally without becoming durable memory.
+
+Saving a sensitive memory does not grant permission for proactive recall. Even
+after the owner confirms long-term storage, sensitive memories should not appear
+in ordinary nostalgic callbacks, casual group-chat reactions, desktop bubbles,
+or routine daily and weekly summaries by default. They may be recalled when the
+owner explicitly asks about the topic, or if the owner later opts into a more
+active recall mode for that memory category.
 
 Photo-backed memories should be designed with a future album in mind. A first
 implementation may store Telegram source references, but the product direction

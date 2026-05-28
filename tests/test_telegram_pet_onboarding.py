@@ -11,6 +11,7 @@ class TelegramPetOnboardingTest(unittest.TestCase):
     def setUp(self) -> None:
         telegram_bot.PENDING_PET_FLOWS.clear()
         telegram_bot.PENDING_AVATAR_FLOWS.clear()
+        telegram_bot.PENDING_FRIENDSHIP_INVITE_FLOWS.clear()
         telegram_bot.PENDING_MEMORY_PHOTO_FLOWS.clear()
         telegram_bot.CURRENT_PET_IDS.clear()
         telegram_bot.OWNER_IDS_BY_CHAT.clear()
@@ -31,6 +32,7 @@ class TelegramPetOnboardingTest(unittest.TestCase):
 
         self.assertIn("创建宠物", reply_labels)
         self.assertIn("宠物关系", reply_labels)
+        self.assertIn("宠物好友", reply_labels)
         self.assertNotIn("宠物群聊", reply_labels)
         self.assertNotIn("设置资料", reply_labels)
         self.assertNotIn("定制形象", reply_labels)
@@ -497,6 +499,88 @@ class TelegramPetOnboardingTest(unittest.TestCase):
         )
         send_message.assert_called_once()
         send_pet_card.assert_called_once()
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_friendship_invite_generation_uses_current_owner_and_pet(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-owner"}
+        telegram_bot.OWNER_IDS_BY_CHAT["chat-owner"] = 12
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [
+            {"id": 7, "name": "黑米", "owner_id": 12, "species": "dog"}
+        ]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"token": "friend-token"}
+        try:
+            telegram_bot.create_friendship_invite_for_pet("chat-owner", 7)
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        post.assert_called_once_with(
+            f"{telegram_bot.API_BASE_URL}/pet-friendship-invites",
+            json={"inviter_owner_id": 12, "inviter_pet_id": 7},
+            timeout=10,
+        )
+        self.assertIn("/pet_friend_invite friend-token", send_message.call_args.args[1])
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_friendship_invite_command_accepts_with_single_pet(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-owner"}
+        telegram_bot.OWNER_IDS_BY_CHAT["chat-owner"] = 12
+
+        def get_response(url: str, **_kwargs: object) -> Mock:
+            response = Mock()
+            response.status_code = 200
+            if url.endswith("/pet-friendship-invites/friend-token"):
+                response.json.return_value = {
+                    "token": "friend-token",
+                    "inviter_pet_name": "黑米",
+                }
+            else:
+                response.json.return_value = [
+                    {"id": 8, "name": "青青", "owner_id": 12, "species": "cat"}
+                ]
+            return response
+
+        get.side_effect = get_response
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {
+            "id": 3,
+            "pet_a_id": 7,
+            "pet_a_name": "黑米",
+            "pet_b_id": 8,
+            "pet_b_name": "青青",
+        }
+        try:
+            handled = telegram_bot.handle_friendship_invite_command(
+                "chat-owner",
+                "/pet_friend_invite friend-token",
+            )
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        self.assertTrue(handled)
+        post.assert_called_once_with(
+            f"{telegram_bot.API_BASE_URL}/pet-friendship-invites/friend-token/accept",
+            json={"receiver_owner_id": 12, "receiver_pet_id": 8},
+            timeout=10,
+        )
+        self.assertIn("已经成为好友", send_message.call_args.args[1])
 
     @patch("telegram_bot.send_message")
     @patch("telegram_bot.requests.get")

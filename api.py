@@ -24,15 +24,19 @@ from image_styles import list_styles
 from image_style_agent import transform_image_style
 from notifier import notifier_from_env
 from pet_db import (
+    accept_pet_friendship_invite,
     create_owner_for_telegram_chat,
+    create_pet_friendship_invite,
     create_pet_memory,
     create_pet,
     delete_pet,
     delete_pet_relationship,
     get_pet,
+    get_pet_friendship_invite,
     get_pet_stats,
     init_db,
     list_pet_memories,
+    list_pet_friendships,
     list_pet_relationships,
     list_pets,
     set_pet_relationship_muted,
@@ -105,6 +109,16 @@ class PetMemoryRequest(BaseModel):
 class OwnerTelegramRequest(BaseModel):
     telegram_chat_id: str
     display_name: str = ""
+
+
+class PetFriendshipInviteCreateRequest(BaseModel):
+    inviter_owner_id: int
+    inviter_pet_id: int
+
+
+class PetFriendshipInviteAcceptRequest(BaseModel):
+    receiver_owner_id: int
+    receiver_pet_id: int
 
 
 class VirtualPetTickRequest(BaseModel):
@@ -295,6 +309,50 @@ def delete_pet_relationship_endpoint(from_pet_id: int, to_pet_id: int) -> dict:
         return delete_pet_relationship(from_pet_id, to_pet_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/pet-friendship-invites")
+def create_pet_friendship_invite_endpoint(
+    payload: PetFriendshipInviteCreateRequest,
+) -> dict:
+    try:
+        return create_pet_friendship_invite(
+            inviter_owner_id=payload.inviter_owner_id,
+            inviter_pet_id=payload.inviter_pet_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/pet-friendship-invites/{token}")
+def get_pet_friendship_invite_endpoint(token: str) -> dict:
+    invite = get_pet_friendship_invite(token)
+    if invite is None:
+        raise HTTPException(status_code=404, detail="friendship invite does not exist")
+    return invite
+
+
+@app.post("/pet-friendship-invites/{token}/accept")
+def accept_pet_friendship_invite_endpoint(
+    token: str,
+    payload: PetFriendshipInviteAcceptRequest,
+) -> dict:
+    try:
+        return accept_pet_friendship_invite(
+            token=token,
+            receiver_owner_id=payload.receiver_owner_id,
+            receiver_pet_id=payload.receiver_pet_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/pet-friendships")
+def list_pet_friendships_endpoint(
+    owner_id: Optional[int] = None,
+    pet_id: Optional[int] = None,
+) -> list[dict]:
+    return list_pet_friendships(owner_id=owner_id, pet_id=pet_id)
 
 
 @app.get("/pet-memories")
