@@ -45,6 +45,7 @@ def _static_path(static_url: str) -> Optional[Path]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Launch the native desktop pet.")
     parser.add_argument("--pet-id", type=int, default=None)
+    parser.add_argument("--offset-index", type=int, default=0)
     args = parser.parse_args()
 
     pet_id = args.pet_id if args.pet_id is not None else _default_virtual_pet_id()
@@ -67,6 +68,7 @@ def main() -> None:
         command.extend(["--image", str(image_path)])
     if manifest_path is not None:
         command.extend(["--manifest", str(manifest_path)])
+    command.extend(["--offset-index", str(args.offset_index)])
 
     subprocess.run(command, check=True)
 

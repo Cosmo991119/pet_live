@@ -7,3 +7,6 @@ python-dotenv
 requests
 sentence-transformers
 uvicorn
+dashscope
+imageio
+imageio-ffmpeg

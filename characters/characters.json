@@ -63,5 +63,32 @@
     "desktop_pet_manifest_url": "/static/desktop_pet_assets/e1f46dd64ca34f12aa7c739303bf25e9/manifest.json",
     "desktop_pet_asset_dir": "/static/desktop_pet_assets/e1f46dd64ca34f12aa7c739303bf25e9",
     "desktop_pet_avatar_url": "/static/desktop_pet_assets/e1f46dd64ca34f12aa7c739303bf25e9/avatar.png"
+  },
+  {
+    "id": "54985956183b4ecf907139f048f8f4b6",
+    "image_url": "/static/generated/bf6d55692310428a91888f9d56fbc9c3.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "根据参考图生成一个适合桌面陪伴的完整宠物形象。\n宠物种类：dog\n性格：黏人 爱撒娇\n外观特征：红色挂耳染，黑色舌头，中长毛\n\n默认不要生成牵引绳、绳子、牵引带、项圈牵绳或被人牵着；除非用户文字里明确要求。\n\n用户对当前预览的修改要求：舌头是黑色的\n\n默认不要生成牵引绳、绳子、牵引带、项圈牵绳或被人牵着；除非用户文字里明确要求。",
+    "created_at": "2026-05-19T09:28:39Z"
+  },
+  {
+    "id": "8bb2abb559984f83812153d08feede54",
+    "image_url": "/static/generated/ed6aac5af45142d2ab746d2f1958a03d.png",
+    "style_mode": "animal_pixel_2d",
+    "description": "左边的小章鱼\n\n固定使用精致 Q 版二次元像素艺术画风；透明背景；无地面、无倒影、无投影、无场景。只转换上传图片的画风，保留主体、姿势、服装、颜色和手持物，不套用旧宠物或动物化设定。",
+    "created_at": "2026-05-22T15:24:58Z",
+    "desktop_pet_manifest_url": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54/manifest.json",
+    "desktop_pet_asset_dir": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54",
+    "desktop_pet_avatar_url": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54/avatar.png",
+    "published_animation_count": 5,
+    "published_animations": [
+      "idle",
+      "relax",
+      "sleep",
+      "walk_left",
+      "walk_right"
+    ],
+    "desktop_pet_asset_provider": "wan",
+    "walking_reference_image_url": "/static/generated/04df50041e0d4714b6562d02b21afff6.png"
   }
 ]

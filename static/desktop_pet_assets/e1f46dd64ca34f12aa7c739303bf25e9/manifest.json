@@ -1,6 +1,7 @@
 {
   "character_id": "e1f46dd64ca34f12aa7c739303bf25e9",
-  "format": "gif-first",
+  "format": "behavior-pose-gif-partial",
+  "generation_status": "partial_ready",
   "canvas": {
     "width": 256,
     "height": 256,
@@ -12,34 +13,80 @@
   },
   "source_image_url": "/static/generated/64993b6f937e443894ad6de2f2717914.png",
   "avatar": "avatar.png",
+  "pose_sources": {
+    "avatar": {
+      "src": "avatar.png",
+      "source": "confirmed_character"
+    },
+    "idle": {
+      "src": "idle_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "standing calmly in a relaxed idle pose, breathing gently, full body visible"
+    },
+    "relax": {
+      "src": "relax_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "lounging lazily in a cozy relaxed pose, peaceful and idle, full body visible"
+    },
+    "walk_right": {
+      "src": "walk_right_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "walking toward the right, one foot forward, lively side-step pose, full body visible"
+    },
+    "walk_left": {
+      "src": "walk_left_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "walking toward the left, one foot forward, lively side-step pose, full body visible"
+    },
+    "sleep": {
+      "src": "sleep_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "sleeping curled up or lying down comfortably, eyes closed, unmistakable sleep pose"
+    },
+    "happy": {
+      "src": "happy_pose.png",
+      "source": "generated_behavior_pose",
+      "prompt": "very happy celebratory pose, smiling brightly, excited cute expression"
+    }
+  },
   "animations": {
     "idle": {
       "type": "gif",
-      "src": "idle.gif"
+      "src": "idle.gif",
+      "pose": "idle_pose.png"
+    },
+    "relax": {
+      "type": "gif",
+      "src": "relax.gif",
+      "pose": "relax_pose.png"
     },
     "walk_right": {
       "type": "gif",
-      "src": "walk_right.gif"
+      "src": "walk_right.gif",
+      "pose": "walk_right_pose.png"
     },
     "walk_left": {
       "type": "gif",
-      "src": "walk_left.gif"
+      "src": "walk_left.gif",
+      "pose": "walk_left_pose.png"
     },
     "sleep": {
       "type": "gif",
-      "src": "sleep.gif"
+      "src": "sleep.gif",
+      "pose": "sleep_pose.png"
     },
     "happy": {
       "type": "gif",
-      "src": "happy.gif"
-    },
-    "work": {
-      "type": "gif",
-      "src": "work.gif"
-    },
-    "alert": {
-      "type": "gif",
-      "src": "alert.gif"
+      "src": "happy.gif",
+      "pose": "happy_pose.png"
     }
+  },
+  "action_animation_map": {
+    "idle": "idle",
+    "relax": "relax",
+    "walk_right": "walk_right",
+    "walk_left": "walk_left",
+    "sleep": "sleep",
+    "happy": "happy"
   }
 }

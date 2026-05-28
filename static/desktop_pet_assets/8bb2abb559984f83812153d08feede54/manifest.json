@@ -1,0 +1,113 @@
+{
+  "character_id": "8bb2abb559984f83812153d08feede54",
+  "format": "behavior-frame-gif-partial",
+  "generation_status": "partial_ready",
+  "canvas": {
+    "width": 256,
+    "height": 256,
+    "background": "transparent"
+  },
+  "anchor": {
+    "x": 128,
+    "y": 228
+  },
+  "source_image_url": "/static/generated/ed6aac5af45142d2ab746d2f1958a03d.png",
+  "avatar": "avatar.png",
+  "pose_sources": {
+    "avatar": {
+      "src": "avatar.png",
+      "source": "confirmed_character"
+    },
+    "idle": {
+      "src": "idle_pose.png",
+      "source": "generated_behavior_frame_sequence",
+      "prompt": "sitting calmly in a relaxed idle pose, upper body gently swaying in place, full seated body visible"
+    },
+    "relax": {
+      "src": "relax_pose.png",
+      "source": "generated_behavior_frames",
+      "prompt": "lounging lazily in a cozy relaxed pose, peaceful and idle, full body visible"
+    },
+    "walk_right": {
+      "src": "walk_right_pose.png",
+      "source": "generated_behavior_frame_sequence",
+      "prompt": "walking in place while facing right, one foot forward, lively step-cycle pose, full body visible"
+    },
+    "walk_left": {
+      "src": "walk_left_pose.png",
+      "source": "generated_behavior_frames",
+      "prompt": "walking in place while facing left, one foot forward, lively step-cycle pose, full body visible"
+    },
+    "sleep": {
+      "src": "sleep_pose.png",
+      "source": "generated_behavior_frame_sequence",
+      "prompt": "sleeping curled up or lying down comfortably, eyes closed, unmistakable sleep pose"
+    }
+  },
+  "animations": {
+    "idle": {
+      "type": "gif",
+      "src": "idle_wan_fullvideo_1779561503.gif",
+      "source": "wan_full_video",
+      "pose": "idle_pose.png",
+      "frames": [
+        "idle_frame_1.png",
+        "idle_frame_2.png",
+        "idle_frame_3.png",
+        "idle_frame_4.png"
+      ]
+    },
+    "relax": {
+      "type": "gif",
+      "src": "relax.gif",
+      "pose": "relax_pose.png",
+      "frames": [
+        "relax_frame_1.png",
+        "relax_frame_2.png",
+        "relax_frame_3.png",
+        "relax_frame_4.png"
+      ]
+    },
+    "walk_right": {
+      "type": "gif",
+      "src": "walk_right.gif",
+      "pose": "walk_right_pose.png",
+      "frames": [
+        "walk_right_frame_1.png",
+        "walk_right_frame_2.png",
+        "walk_right_frame_3.png",
+        "walk_right_frame_4.png"
+      ]
+    },
+    "walk_left": {
+      "type": "gif",
+      "src": "walk_left.gif",
+      "pose": "walk_left_pose.png",
+      "frames": [
+        "walk_left_frame_1.png",
+        "walk_left_frame_2.png",
+        "walk_left_frame_3.png",
+        "walk_left_frame_4.png"
+      ]
+    },
+    "sleep": {
+      "type": "gif",
+      "src": "sleep_wan_fullvideo_1779963980.gif",
+      "source": "wan_full_video",
+      "pose": "sleep_pose.png",
+      "frames": [
+        "sleep_frame_1.png",
+        "sleep_frame_2.png",
+        "sleep_frame_3.png",
+        "sleep_frame_4.png"
+      ]
+    }
+  },
+  "action_animation_map": {
+    "idle": "idle",
+    "relax": "relax",
+    "walk_right": "walk_right",
+    "walk_left": "walk_left",
+    "sleep": "sleep"
+  }
+}

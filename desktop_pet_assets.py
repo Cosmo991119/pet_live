@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -22,17 +22,32 @@ class AnimationSpec:
     pose_name: str
     duration: int
     prompt: str
+    frame_count: int = 4
 
 
 PoseImageGenerator = Callable[[dict[str, Any], AnimationSpec, Path], Path]
+FrameSheetGenerator = Callable[[dict[str, Any], AnimationSpec, Path], Path]
+FrameSequenceGenerator = Callable[[dict[str, Any], AnimationSpec, Path], list[Path]]
+
+BASIC_DESKTOP_ANIMATION_NAMES = (
+    "idle",
+    "walk_right",
+    "walk_left",
+    "sleep",
+    "happy",
+)
 
 
 ANIMATION_SPECS = [
     AnimationSpec(
         name="idle",
         pose_name="idle",
-        duration=220,
-        prompt="standing calmly in a relaxed idle pose, breathing gently, full body visible",
+        duration=440,
+        prompt=(
+            "sitting calmly in a relaxed idle pose, upper body gently swaying in place, "
+            "full seated body visible"
+        ),
+        frame_count=4,
     ),
     AnimationSpec(
         name="relax",
@@ -44,13 +59,19 @@ ANIMATION_SPECS = [
         name="walk_right",
         pose_name="walk_right",
         duration=140,
-        prompt="walking toward the right, one foot forward, lively side-step pose, full body visible",
+        prompt=(
+            "walking in place while facing right, one foot forward, lively step-cycle pose, "
+            "full body visible"
+        ),
     ),
     AnimationSpec(
         name="walk_left",
         pose_name="walk_left",
         duration=140,
-        prompt="walking toward the left, one foot forward, lively side-step pose, full body visible",
+        prompt=(
+            "walking in place while facing left, one foot forward, lively step-cycle pose, "
+            "full body visible"
+        ),
     ),
     AnimationSpec(
         name="sleep",
@@ -115,6 +136,13 @@ ANIMATION_SPECS = [
 ]
 
 
+def animation_specs_for(names: Sequence[str] | None = None) -> list[AnimationSpec]:
+    if names is None:
+        names = BASIC_DESKTOP_ANIMATION_NAMES
+    requested = set(names)
+    return [spec for spec in ANIMATION_SPECS if spec.name in requested]
+
+
 def _static_url_to_path(image_url: str) -> Path:
     clean = image_url.split("?", 1)[0]
     if not clean.startswith("/static/"):
@@ -130,6 +158,11 @@ def _static_url_to_path(image_url: str) -> Path:
 
 def _remove_flat_background(image: Image.Image) -> Image.Image:
     rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    alpha_min, alpha_max = alpha.getextrema()
+    if alpha_min < 255 and alpha_max > 0:
+        return rgba
+
     pixels = rgba.load()
     width, height = rgba.size
     corner_colors = [
@@ -222,8 +255,37 @@ def _fit_canvas(subject: Image.Image) -> Image.Image:
 
 def _prepare_pose_image(path: Path) -> Image.Image:
     with Image.open(path) as image:
-        subject = _largest_subject(_remove_flat_background(image))
-        return _fit_canvas(subject)
+        return _prepare_pose_image_from_image(image)
+
+
+def _prepare_pose_image_from_image(image: Image.Image) -> Image.Image:
+    subject = _largest_subject(_remove_flat_background(image))
+    return _fit_canvas(subject)
+
+
+def _frames_from_sheet(path: Path, frame_count: int) -> list[Image.Image]:
+    with Image.open(path) as image:
+        rgba = image.convert("RGBA")
+        width, height = rgba.size
+        if frame_count <= 1 or width < frame_count:
+            return [_prepare_pose_image_from_image(rgba)]
+        frame_width = width // frame_count
+        frames = []
+        for index in range(frame_count):
+            left = index * frame_width
+            right = width if index == frame_count - 1 else (index + 1) * frame_width
+            frame = rgba.crop((left, 0, right, height))
+            frames.append(_prepare_pose_image_from_image(frame))
+        return frames
+
+
+def _save_frame_sequence(output_dir: Path, name: str, frames: list[Image.Image]) -> list[str]:
+    frame_names = []
+    for index, frame in enumerate(frames, start=1):
+        frame_name = f"{name}_frame_{index}.png"
+        frame.save(output_dir / frame_name)
+        frame_names.append(frame_name)
+    return frame_names
 
 
 def _frame(base: Image.Image, dx: int = 0, dy: int = 0, scale_y: float = 1.0) -> Image.Image:
@@ -238,27 +300,21 @@ def _frame(base: Image.Image, dx: int = 0, dy: int = 0, scale_y: float = 1.0) ->
     return canvas
 
 
+def _brightness_frame(base: Image.Image, factor: float) -> Image.Image:
+    rgba = base.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    rgb = ImageEnhance.Brightness(rgba.convert("RGB")).enhance(factor)
+    output = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    output.paste(rgb)
+    output.putalpha(alpha)
+    return output
+
+
 def _frames_for_animation(name: str, pose: Image.Image) -> list[Image.Image]:
-    if name in {"walk_right", "walk_left"}:
-        return [
-            _frame(pose, dx=-7, dy=2),
-            _frame(pose, dx=0, dy=-4),
-            _frame(pose, dx=7, dy=2),
-            _frame(pose, dx=0, dy=0),
-        ]
-    if name == "sleep":
-        return [_frame(pose, dy=1, scale_y=0.98), _frame(pose, dy=2, scale_y=1.0)]
-    if name == "happy":
-        return [_frame(pose, dy=0), _frame(pose, dy=-10), _frame(pose, dy=0)]
-    if name == "alert":
-        return [_frame(pose, dy=-7), _frame(pose, dy=0)]
-    if name in {"feed", "refill", "play", "pet", "clean"}:
-        return [_frame(pose, dx=-2), _frame(pose, dx=2), _frame(pose, dy=-3), _frame(pose, dx=0)]
-    if name == "lullaby":
-        return [_frame(pose, dy=0), _frame(pose, dy=2, scale_y=0.99)]
-    if name == "relax":
-        return [_frame(pose, dy=0), _frame(pose, dy=1), _frame(pose, dy=0)]
-    return [_frame(pose, dy=0), _frame(pose, dy=-4), _frame(pose, dy=0)]
+    if name == "idle":
+        return [_frame(pose), _brightness_frame(pose, 0.97)]
+    frame_count = 4 if name in {"walk_right", "walk_left", "feed", "refill", "play", "pet", "clean"} else 3
+    return [_frame(pose) for _ in range(frame_count)]
 
 
 def _save_gif(path: Path, frames: list[Image.Image], duration: int = 160) -> None:
@@ -272,18 +328,17 @@ def _save_gif(path: Path, frames: list[Image.Image], duration: int = 160) -> Non
         loop=0,
         disposal=2,
         transparency=0,
+        optimize=False,
     )
 
 
 def _gif_frame(frame: Image.Image) -> Image.Image:
     rgba = frame.convert("RGBA")
     alpha = rgba.getchannel("A")
-    opaque = Image.new("RGB", rgba.size, (255, 0, 255))
-    opaque.paste(rgba.convert("RGB"), mask=alpha)
-    quantized = opaque.quantize(colors=255, method=Image.Quantize.MEDIANCUT)
+    quantized = rgba.convert("RGB").quantize(colors=255, method=Image.Quantize.MEDIANCUT)
 
     output = Image.new("P", rgba.size, 0)
-    palette = [255, 0, 255] + quantized.getpalette()[: 255 * 3]
+    palette = [0, 0, 0] + quantized.getpalette()[: 255 * 3]
     palette.extend([0] * (768 - len(palette)))
     output.putpalette(palette)
 
@@ -302,6 +357,9 @@ def _gif_frame(frame: Image.Image) -> Image.Image:
 def build_desktop_pet_assets(
     character: dict[str, Any],
     pose_image_generator: PoseImageGenerator | None = None,
+    frame_sequence_generator: FrameSequenceGenerator | None = None,
+    frame_sheet_generator: FrameSheetGenerator | None = None,
+    animation_names: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Create a desktop-pet asset pack and return manifest metadata."""
     character_id = character["id"]
@@ -318,21 +376,136 @@ def build_desktop_pet_assets(
         "avatar": {"src": "avatar.png", "source": "confirmed_character"}
     }
     generated_poses: dict[str, Image.Image] = {}
+    generated_frames: dict[str, list[Image.Image]] = {}
 
-    for spec in ANIMATION_SPECS:
+    selected_specs = animation_specs_for(animation_names)
+
+    def source_frames_for_spec(spec: AnimationSpec) -> tuple[list[Image.Image], str, Path]:
         pose_path = output_dir / f"{spec.pose_name}_pose.png"
-        source_label = "confirmed_character_fallback"
+        if frame_sequence_generator:
+            frame_paths = frame_sequence_generator(character, spec, output_dir)
+            return [_prepare_pose_image(path) for path in frame_paths], "generated_behavior_frame_sequence", pose_path
+        if frame_sheet_generator:
+            sheet_path = frame_sheet_generator(character, spec, output_dir)
+            return _frames_from_sheet(sheet_path, spec.frame_count), "generated_behavior_frames", pose_path
         if pose_image_generator:
             pose_path = pose_image_generator(character, spec, output_dir)
-            source_label = "generated_behavior_pose"
+            pose = _prepare_pose_image(pose_path) if pose_path.exists() else avatar.copy()
+            return _frames_for_animation(spec.name, pose), "generated_behavior_pose", pose_path
 
         pose = _prepare_pose_image(pose_path) if pose_path.exists() else avatar.copy()
-        if spec.name == "walk_left" and not pose_image_generator and "walk_right" in generated_poses:
+        if spec.name == "walk_left" and "walk_right" in generated_poses:
             pose = ImageOps.mirror(generated_poses["walk_right"])
+        return _frames_for_animation(spec.name, pose), "confirmed_character_fallback", pose_path
+
+    for spec in selected_specs:
+        pose_path = output_dir / f"{spec.pose_name}_pose.png"
+        source_label = "confirmed_character_fallback"
+        frame_names: list[str] = []
+        generated_gif_path = output_dir / f"{spec.name}.gif"
+        generated_gif_stat = generated_gif_path.stat() if generated_gif_path.exists() else None
+
+        if spec.name == "walk_left":
+            if "walk_right" not in generated_frames:
+                walk_right_spec = next(item for item in ANIMATION_SPECS if item.name == "walk_right")
+                right_frames, _right_source_label, _right_pose_path = source_frames_for_spec(walk_right_spec)
+                generated_frames["walk_right"] = right_frames
+                generated_poses["walk_right"] = right_frames[0] if right_frames else avatar.copy()
+            frames = [ImageOps.mirror(frame) for frame in generated_frames["walk_right"]]
+            source_label = "mirrored_from_walk_right"
+        else:
+            frames, source_label, pose_path = source_frames_for_spec(spec)
 
         saved_pose = output_dir / f"{spec.name}_pose.png"
+        pose = frames[0] if frames else avatar.copy()
         pose.save(saved_pose)
+        frame_names = _save_frame_sequence(output_dir, spec.name, frames)
         generated_poses[spec.name] = pose
+        generated_frames[spec.name] = frames
+        current_gif_stat = generated_gif_path.stat() if generated_gif_path.exists() else None
+        generator_wrote_gif = (
+            frame_sequence_generator is not None
+            and current_gif_stat is not None
+            and (
+                generated_gif_stat is None
+                or current_gif_stat.st_mtime_ns != generated_gif_stat.st_mtime_ns
+                or current_gif_stat.st_size != generated_gif_stat.st_size
+            )
+        )
+        if not generator_wrote_gif:
+            _save_gif(generated_gif_path, frames, spec.duration)
+        animations[spec.name] = {
+            "type": "gif",
+            "src": f"{spec.name}.gif",
+            "pose": saved_pose.name,
+            "frames": frame_names,
+        }
+        pose_sources[spec.name] = {
+            "src": saved_pose.name,
+            "source": source_label,
+            "prompt": spec.prompt,
+        }
+
+    action_animation_map = {
+        spec.name: spec.name
+        for spec in selected_specs
+        if spec.name in animations
+    }
+    manifest = {
+        "character_id": character_id,
+        "format": "behavior-pose-gif",
+        "generation_scope": "basic" if animation_names is None else "custom",
+        "canvas": {"width": CANVAS_SIZE, "height": CANVAS_SIZE, "background": "transparent"},
+        "anchor": {"x": CANVAS_SIZE // 2, "y": 228},
+        "source_image_url": character["image_url"],
+        "avatar": "avatar.png",
+        "pose_sources": pose_sources,
+        "animations": animations,
+        "action_animation_map": action_animation_map,
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "desktop_pet_manifest_url": f"/static/desktop_pet_assets/{character_id}/manifest.json",
+        "desktop_pet_asset_dir": f"/static/desktop_pet_assets/{character_id}",
+        "desktop_pet_avatar_url": f"/static/desktop_pet_assets/{character_id}/avatar.png",
+    }
+
+
+def publish_existing_behavior_poses(character: dict[str, Any]) -> dict[str, Any]:
+    """Publish a partial asset pack from behavior poses already present on disk."""
+    character_id = character["id"]
+    source_path = _static_url_to_path(character["image_url"])
+    output_dir = ASSET_ROOT / character_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    avatar = _prepare_pose_image(source_path)
+    avatar_path = output_dir / "avatar.png"
+    avatar.save(avatar_path)
+
+    animations: dict[str, dict[str, str]] = {}
+    pose_sources: dict[str, dict[str, str]] = {
+        "avatar": {"src": "avatar.png", "source": "confirmed_character"}
+    }
+    action_animation_map: dict[str, str] = {"idle": "idle"}
+
+    for spec in ANIMATION_SPECS:
+        model_pose = output_dir / f"{spec.pose_name}_model_pose.png"
+        existing_pose = output_dir / f"{spec.pose_name}_pose.png"
+        if model_pose.exists():
+            pose_path = model_pose
+            source_label = "generated_behavior_pose"
+        elif spec.name == "idle":
+            pose_path = existing_pose if existing_pose.exists() else avatar_path
+            source_label = "confirmed_character_fallback"
+        else:
+            continue
+
+        pose = _prepare_pose_image(pose_path)
+        saved_pose = output_dir / f"{spec.name}_pose.png"
+        pose.save(saved_pose)
         _save_gif(output_dir / f"{spec.name}.gif", _frames_for_animation(spec.name, pose), spec.duration)
         animations[spec.name] = {
             "type": "gif",
@@ -344,28 +517,19 @@ def build_desktop_pet_assets(
             "source": source_label,
             "prompt": spec.prompt,
         }
+        action_animation_map[spec.name] = spec.name
 
     manifest = {
         "character_id": character_id,
-        "format": "behavior-pose-gif",
+        "format": "behavior-pose-gif-partial",
+        "generation_status": "partial_ready",
         "canvas": {"width": CANVAS_SIZE, "height": CANVAS_SIZE, "background": "transparent"},
         "anchor": {"x": CANVAS_SIZE // 2, "y": 228},
         "source_image_url": character["image_url"],
         "avatar": "avatar.png",
         "pose_sources": pose_sources,
         "animations": animations,
-        "action_animation_map": {
-            "feed": "feed",
-            "refill": "refill",
-            "play": "play",
-            "pet": "pet",
-            "clean": "clean",
-            "lullaby": "lullaby",
-            "sleep": "sleep",
-            "work": "work",
-            "relax": "relax",
-            "idle": "idle",
-        },
+        "action_animation_map": action_animation_map,
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -375,4 +539,101 @@ def build_desktop_pet_assets(
         "desktop_pet_manifest_url": f"/static/desktop_pet_assets/{character_id}/manifest.json",
         "desktop_pet_asset_dir": f"/static/desktop_pet_assets/{character_id}",
         "desktop_pet_avatar_url": f"/static/desktop_pet_assets/{character_id}/avatar.png",
+        "published_animation_count": len(animations),
+        "published_animations": sorted(animations),
+    }
+
+
+def publish_existing_behavior_assets(character: dict[str, Any]) -> dict[str, Any]:
+    """Publish a partial asset pack from any behavior sheets or poses already present."""
+    character_id = character["id"]
+    source_path = _static_url_to_path(character["image_url"])
+    output_dir = ASSET_ROOT / character_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    avatar = _prepare_pose_image(source_path)
+    avatar_path = output_dir / "avatar.png"
+    avatar.save(avatar_path)
+
+    animations: dict[str, dict[str, Any]] = {}
+    pose_sources: dict[str, dict[str, str]] = {
+        "avatar": {"src": "avatar.png", "source": "confirmed_character"}
+    }
+    action_animation_map: dict[str, str] = {"idle": "idle"}
+
+    for spec in ANIMATION_SPECS:
+        model_frames = [
+            output_dir / f"{spec.pose_name}_model_frame_{index}.png"
+            for index in range(1, spec.frame_count + 1)
+        ]
+        model_sheet = output_dir / f"{spec.pose_name}_model_sheet.png"
+        model_pose = output_dir / f"{spec.pose_name}_model_pose.png"
+        existing_pose = output_dir / f"{spec.pose_name}_pose.png"
+        frame_names: list[str] = []
+
+        if all(path.exists() for path in model_frames):
+            frames = [_prepare_pose_image(path) for path in model_frames]
+            source_label = "generated_behavior_frame_sequence"
+        elif model_sheet.exists():
+            frames = _frames_from_sheet(model_sheet, spec.frame_count)
+            source_label = "generated_behavior_frames"
+        elif model_pose.exists():
+            pose = _prepare_pose_image(model_pose)
+            frames = _frames_for_animation(spec.name, pose)
+            source_label = "generated_behavior_pose"
+        elif spec.name == "idle":
+            pose_path = existing_pose if existing_pose.exists() else avatar_path
+            pose = _prepare_pose_image(pose_path)
+            frames = _frames_for_animation(spec.name, pose)
+            source_label = "confirmed_character_fallback"
+        else:
+            continue
+
+        saved_pose = output_dir / f"{spec.name}_pose.png"
+        pose = frames[0] if frames else avatar.copy()
+        pose.save(saved_pose)
+        frame_names = _save_frame_sequence(output_dir, spec.name, frames)
+        gif_path = output_dir / f"{spec.name}.gif"
+        existing_gif_is_current = (
+            gif_path.exists()
+            and source_label == "generated_behavior_frame_sequence"
+            and gif_path.stat().st_mtime_ns >= max(path.stat().st_mtime_ns for path in model_frames)
+        )
+        if not existing_gif_is_current:
+            _save_gif(gif_path, frames, spec.duration)
+        animations[spec.name] = {
+            "type": "gif",
+            "src": f"{spec.name}.gif",
+            "pose": saved_pose.name,
+            "frames": frame_names,
+        }
+        pose_sources[spec.name] = {
+            "src": saved_pose.name,
+            "source": source_label,
+            "prompt": spec.prompt,
+        }
+        action_animation_map[spec.name] = spec.name
+
+    manifest = {
+        "character_id": character_id,
+        "format": "behavior-frame-gif-partial",
+        "generation_status": "partial_ready",
+        "canvas": {"width": CANVAS_SIZE, "height": CANVAS_SIZE, "background": "transparent"},
+        "anchor": {"x": CANVAS_SIZE // 2, "y": 228},
+        "source_image_url": character["image_url"],
+        "avatar": "avatar.png",
+        "pose_sources": pose_sources,
+        "animations": animations,
+        "action_animation_map": action_animation_map,
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "desktop_pet_manifest_url": f"/static/desktop_pet_assets/{character_id}/manifest.json",
+        "desktop_pet_asset_dir": f"/static/desktop_pet_assets/{character_id}",
+        "desktop_pet_avatar_url": f"/static/desktop_pet_assets/{character_id}/avatar.png",
+        "published_animation_count": len(animations),
+        "published_animations": sorted(animations),
     }

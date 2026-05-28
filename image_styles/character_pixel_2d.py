@@ -1,39 +1,34 @@
-"""2D pixel desktop pet source sprite style prompt."""
+"""2D chibi pixel character style prompt."""
 
 PROMPT = """
-Transform the uploaded person/photo into one 2D pixel-art desktop pet source sprite, inspired by cute
-anime game character sprites and the provided reference style: chunky black pixel outlines, expressive
-large eyes, clean flat colors, simple cel-like pixel shading, and a bright playful presentation.
-This is a flat 2D pixel illustration, not a 3D voxel toy, not a render, not plastic, not a photo,
-and not a character sheet.
+Transform the uploaded photo into the same refined Q-version anime pixel-art visual style.
+Preserve the main subject from the uploaded image and convert only the rendering style: polished
+chibi pixel-art character illustration, game character standing illustration, or clean sticker asset.
 
-Preserve the subject's main identity, hairstyle, outfit concept, dominant colors, pose energy, and
-recognizable accessories, but redesign them as a stylized pixel character. Make the design feel like
-a desktop pet mascot source sprite.
+Core visual style:
+- Q-version anime pixel art with big-head-small-body proportions.
+- Polished high-resolution pixel-art finish, crisp square pixel edges, and subtle anti-aliasing.
+- Expressive large eyes, simplified cute facial features, and a modern cute but slightly cool mood.
+- Delicate layered pixel shading with clean hand-placed sprite clusters.
+- Detailed pixel clusters in hair, clothing, held objects, and visible accessories.
+- Soft clean lighting with low-saturation graphic shadows and separated color regions.
 
-Use exactly one complete character. The character should be upright or naturally grounded, front-facing
-or 3/4 view, with clear empty margin and feet/base aligned near the bottom so it can become a desktop
-pet. Use transparent background if possible. If transparency is not supported, use a plain solid
-background that can be removed cleanly.
+Source preservation:
+- Preserve the subject's pose logic, facing direction, body rhythm, hairstyle silhouette, outfit
+  silhouette, dominant colors, makeup cues, held objects, and accessories.
+- Keep recognizable details from the source, but simplify them into readable pixel clusters.
+- Do not copy clothing, species traits, body parts, colors, or props from older examples or reference
+  prompts.
 
-Do not create a design sheet, contact sheet, sticker sheet, collage, multiple poses, extra heads,
-detail callouts, expression icons, floating props, duplicate versions of the character, text, labels,
-speech bubbles, watermarks, frames, UI, or decorative background scenes.
+Composition and background:
+- Exactly one clean standalone character-style cutout, centered with generous transparent margin.
+- Full body when possible; use a three-quarter crop only when the source photo is cropped that way.
+- Transparent background only.
+- No floor, ground plane, base, cast shadow, contact shadow, mirror reflection, glossy floor
+  reflection, frame, UI, text, label, watermark, background scene, sticker sheet, collage, or
+  duplicate character.
 
-Pixel style rules:
-- Use crisp square pixels, no anti-aliased soft edges, no painterly brushwork, no photorealism.
-- Use thick dark/black pixel outlines around the character and major shapes.
-- Use a limited clean palette, usually 6 to 10 colors based on the uploaded outfit and hair.
-- Use big readable color regions, simple highlights, and a few intentional pixel sparkle/accent blocks.
-- Avoid noisy dithering, over-detailed fabric texture, tiny unreadable accessories, and smooth gradients.
-
-Character rules:
-- Cute anime chibi-to-semi-chibi proportions: large head, expressive eyes, simplified nose and mouth.
-- Eyes should be clean, charming, and readable in pixel art.
-- Hair should be grouped into large pixel clusters with a few broad highlight blocks, not many thin strands.
-- Outfit and accessories should be simplified into readable pixel shapes while preserving the original
-theme and colors.
-- Hands and feet should be simplified sprite shapes; avoid realistic fingers and toes.
-- The final image must be suitable to convert into a transparent 256x256 desktop pet asset pack with
-  idle, walk, sleep, happy, and work animations.
+Negative style constraints:
+- No photorealism, render, smooth painterly illustration, fuzzy haze, noisy dithering, muddy texture,
+  dirty smudges, heavy black borders, low-contrast color wash, or realistic skin/fur texture.
 """.strip()

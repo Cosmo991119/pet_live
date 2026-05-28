@@ -25,6 +25,15 @@ class DesktopCompanionResult:
     process: Optional[subprocess.Popen] = None
 
 
+@dataclass
+class DesktopCompanionGroupResult:
+    ok: bool
+    code: str
+    message: str
+    trace_id: str
+    results: list[DesktopCompanionResult]
+
+
 class PetRuntimeController:
     """Coordinate local runtime actions behind a small product-facing interface."""
 
@@ -40,12 +49,18 @@ class PetRuntimeController:
         self.default_pet_id = default_pet_id
         self.db_path = db_path
         self._popen = popen
-        self._desktop_process: Optional[subprocess.Popen] = None
+        self._desktop_processes: dict[int, subprocess.Popen] = {}
 
-    def launch_desktop_companion(self, chat_id: str = "") -> DesktopCompanionResult:
+    def launch_desktop_companion(
+        self,
+        chat_id: str = "",
+        pet_id: Optional[int] = None,
+        offset_index: int = 0,
+    ) -> DesktopCompanionResult:
         trace_id = new_trace_id("desktop")
         try:
-            pet = self._default_pet()
+            pet = self._pet_for_launch(pet_id)
+            pet_id = int(pet["id"])
             manifest_url = self._profile(pet).get("desktop_pet_manifest_url", "")
             manifest_path = self._local_static_path(manifest_url)
             if manifest_path is None:
@@ -57,45 +72,49 @@ class PetRuntimeController:
                     pet=pet,
                 )
 
-            if self._desktop_process and self._desktop_process.poll() is None:
+            running_process = self._desktop_processes.get(pet_id)
+            if running_process and running_process.poll() is None:
                 return DesktopCompanionResult(
                     ok=True,
                     code="DESKTOP_ALREADY_RUNNING",
                     message=f"{pet['name']} 已经在桌面陪你了。",
                     trace_id=trace_id,
                     pet=pet,
-                    pid=self._desktop_process.pid,
-                    process=self._desktop_process,
+                    pid=running_process.pid,
+                    process=running_process,
                 )
 
             log_event(
                 "desktop_pet_launch_started",
                 trace_id,
                 chat_id=chat_id,
-                pet_id=pet["id"],
+                pet_id=pet_id,
                 manifest=manifest_url,
             )
             log_dir = self.project_root / "logs"
             log_dir.mkdir(exist_ok=True)
             with (log_dir / "desktop_pet_launch.log").open("ab") as log_file:
-                self._desktop_process = self._popen(
+                process = self._popen(
                     [
                         sys.executable,
                         str(self.project_root / "launch_desktop_pet.py"),
                         "--pet-id",
-                        str(pet["id"]),
+                        str(pet_id),
+                        "--offset-index",
+                        str(offset_index),
                     ],
                     cwd=self.project_root,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
+            self._desktop_processes[pet_id] = process
             log_event(
                 "desktop_pet_launch_spawned",
                 trace_id,
                 chat_id=chat_id,
-                pet_id=pet["id"],
-                pid=self._desktop_process.pid,
+                pet_id=pet_id,
+                pid=process.pid,
             )
             return DesktopCompanionResult(
                 ok=True,
@@ -103,8 +122,8 @@ class PetRuntimeController:
                 message=f"好，{pet['name']} 出发去桌面陪你了。",
                 trace_id=trace_id,
                 pet=pet,
-                pid=self._desktop_process.pid,
-                process=self._desktop_process,
+                pid=process.pid,
+                process=process,
             )
         except Exception as exc:
             code = self._error_code(exc)
@@ -116,7 +135,86 @@ class PetRuntimeController:
                 trace_id=trace_id,
             )
 
-    def _default_pet(self) -> dict:
+    def launch_all_desktop_companions(self, chat_id: str = "") -> DesktopCompanionGroupResult:
+        trace_id = new_trace_id("desktop_group")
+        try:
+            pets = list_pets(db_path=self.db_path)
+        except Exception as exc:
+            code = self._error_code(exc)
+            log_exception("desktop_pet_group_launch_failed", trace_id, exc, chat_id=chat_id)
+            return DesktopCompanionGroupResult(
+                ok=False,
+                code=code,
+                message=f"桌面陪伴启动失败。\n错误码：{code}\n调试编号：{trace_id}\n错误原因：{exc}",
+                trace_id=trace_id,
+                results=[],
+            )
+        if not pets:
+            return DesktopCompanionGroupResult(
+                ok=False,
+                code="DESKTOP_PET_NOT_FOUND",
+                message="还没有宠物。先创建一只宠物，再让它们来桌面陪你。",
+                trace_id=trace_id,
+                results=[],
+            )
+
+        results = [
+            self.launch_desktop_companion(chat_id=chat_id, pet_id=int(pet["id"]), offset_index=index)
+            for index, pet in enumerate(pets)
+        ]
+        active_names = [
+            str(result.pet.get("name", "宠物"))
+            for result in results
+            if result.ok and result.code in {"DESKTOP_LAUNCHED", "DESKTOP_ALREADY_RUNNING"} and result.pet
+        ]
+        waiting_names = [
+            str(result.pet.get("name", "宠物"))
+            for result in results
+            if result.code == "DESKTOP_ASSETS_MISSING" and result.pet
+        ]
+        failed_results = [
+            result for result in results
+            if not result.ok and result.code != "DESKTOP_ASSETS_MISSING"
+        ]
+
+        if active_names:
+            parts = [f"{'、'.join(active_names)} 已经在桌面陪你了。"]
+            if waiting_names:
+                parts.append(f"{'、'.join(waiting_names)} 还没有桌宠动作素材，先留在群聊里。")
+            if failed_results:
+                parts.append(f"{len(failed_results)} 只宠物启动失败，调试编号见日志。")
+            return DesktopCompanionGroupResult(
+                ok=True,
+                code="DESKTOP_GROUP_LAUNCHED",
+                message="\n".join(parts),
+                trace_id=trace_id,
+                results=results,
+            )
+
+        if waiting_names and not failed_results:
+            return DesktopCompanionGroupResult(
+                ok=False,
+                code="DESKTOP_ASSETS_MISSING",
+                message="现在还没有可上桌面的宠物素材。先给宠物生成形象并确认，桌宠素材会在后台完成。",
+                trace_id=trace_id,
+                results=results,
+            )
+
+        return DesktopCompanionGroupResult(
+            ok=False,
+            code="DESKTOP_GROUP_LAUNCH_FAILED",
+            message="这次没有成功启动桌面陪伴，请看调试编号排查。",
+            trace_id=trace_id,
+            results=results,
+        )
+
+    def _pet_for_launch(self, pet_id: Optional[int] = None) -> dict:
+        if pet_id is not None:
+            pet = get_pet(int(pet_id), db_path=self.db_path)
+            if pet is None:
+                raise RuntimeError(f"DESKTOP_PET_NOT_FOUND: 找不到宠物：{pet_id}")
+            return pet
+
         if self.default_pet_id:
             pet = get_pet(int(self.default_pet_id), db_path=self.db_path)
             if pet is None:

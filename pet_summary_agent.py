@@ -14,7 +14,7 @@ from pet_message_agent import _safe_json_from_text
 
 PET_SUMMARY_PROMPT_VERSION = "pet_summary_v1"
 FALLBACK_MODEL_NAME = "fallback-template"
-DEFAULT_LLM_MODEL_NAME = "poe-default"
+DEFAULT_LLM_MODEL_NAME = "openai-default"
 
 LLMCall = Callable[[list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]
 
@@ -96,9 +96,9 @@ def _build_prompt(pet: dict[str, Any], stats: dict[str, Any]) -> list[dict[str, 
 
 
 def _call_default_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    from llm_poe import poe_llm_call
+    from llm_openai import openai_llm_call
 
-    return poe_llm_call(messages, [])
+    return openai_llm_call(messages, [])
 
 
 def _normalize_summary(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -149,7 +149,7 @@ def generate_summary(
         parsed = _safe_json_from_text(text)
         if not parsed:
             raise ValueError("LLM did not return parseable JSON")
-        return _normalize_summary(parsed), DEFAULT_LLM_MODEL_NAME
+        return _normalize_summary(parsed), response.get("model", DEFAULT_LLM_MODEL_NAME)
     except Exception:
         return _fallback_summary(pet, stats), FALLBACK_MODEL_NAME
 

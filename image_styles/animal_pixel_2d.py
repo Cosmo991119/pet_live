@@ -1,68 +1,44 @@
-"""2D animalized desktop pet source sprite style prompt."""
+"""2D chibi pixel avatar style prompt for Telegram photo conversion."""
 
 PROMPT = """
-Transform the uploaded person/photo into one 2D pixel-art animalized desktop pet source sprite.
-The animal species is specified by the user's additional requirement, for example: octopus,
-cat, fox, rabbit, mouse, shark, bird, deer, dragon, or any other animal word. Treat that animal
-word as the primary transformation target.
-If the uploaded image already shows an animal and the requested animal matches it, preserve that
-animal as the main character instead of forcing a humanoid redesign.
+Transform the uploaded photo into the same refined Q-version anime pixel-art visual style.
+This mode is for style transfer: preserve the main subject from the uploaded image and convert it
+into a polished chibi pixel-art character illustration. Do not animalize, redesign, or turn the
+subject into a generic mascot unless the user's current text explicitly asks for that.
 
-This is a flat 2D pixel desktop pet sprite source, not a 3D voxel toy, not a render, not plastic,
-not a photo, and not a character sheet.
-The output should feel like a cute anime game desktop mascot: chunky black pixel outlines,
-expressive large eyes, clean flat colors, simple pixel shading, and a readable single-character
-presentation.
-Prioritize cuteness and abstraction over literal realism. The animal should feel like a charming
-game mascot, sticker character, or collectible avatar, not a direct realistic animal portrait.
+Core visual style:
+- Q-version anime pixel art with big-head-small-body proportions.
+- Polished high-resolution pixel-art finish, crisp square pixel edges, and subtle anti-aliasing.
+- Expressive large eyes, simplified cute facial features, and a modern cute but slightly cool mood.
+- Delicate layered pixel shading with clean hand-placed sprite clusters.
+- Detailed pixel clusters in hair, clothing, plush toys, phones, watches, jewelry, and other visible
+  accessories from the source.
+- Soft clean lighting with low-saturation graphic shadows and separated color regions.
+- Game character standing illustration or sticker quality, not a photo, render, painting, design
+  sheet, or character turnaround.
 
-Preserve the subject's main identity signals from the photo: hairstyle silhouette, outfit concept,
-dominant colors, pose energy, and recognizable accessories. Redesign those elements as a stylized
-anthropomorphic animal character based on the requested animal. The animal traits should be obvious
-but still cute and readable.
-For animal photos, preserve the original animal's silhouette, fur/skin pattern, markings, pose,
-expression, and mood. The approved direction is a clean pixel animal desktop pet sprite with
-charming game-avatar readability.
-Abstract the animal into simplified iconic shapes: bigger head, smaller body, round cheeks, oversized
-expressive eyes, tiny mouth, compact paws/feet, and a clean readable silhouette. Keep only the most
-recognizable markings and turn them into bold graphic symbols.
+Source preservation:
+- Preserve the primary subject's pose logic, facing direction, body rhythm, hairstyle silhouette,
+  outfit silhouette, dominant colors, makeup cues, held objects, accessories, and important companion
+  plush or object when it is being held.
+- If the uploaded image contains multiple people, pets, toys, or characters, follow the user's text
+  for subject selection. If no subject is specified, use the most prominent foreground subject and
+  include the held plush/object when it is part of the composition.
+- Keep recognizable details from the source, but simplify them into readable pixel clusters.
+- Do not copy clothing, species traits, body parts, colors, or props from older examples or reference
+  prompts.
 
-Animalization rules:
-- If the requested animal has ears, horns, fins, wings, tail, tentacles, shell, whiskers, snout,
-  beak, scales, or other iconic traits, add the most recognizable 2 to 4 traits.
-- Integrate animal traits into the hairstyle, hood, outfit, or body shape rather than scattering them
-  randomly.
-- Preserve the outfit's main color story, but adapt trim/accent shapes to the animal theme.
-- For "octopus", use cute tentacle hair/side locks or a tentacle lower body, round head silhouette,
-  suction-cup accent pixels, ocean-like accent colors if appropriate, and keep the character charming.
-- For "cat", preserve tabby stripes, ear shape, whisker cues, sleepy or playful expression, and the
-  original pose when it is distinctive. Use bold readable stripe clusters instead of noisy fur texture.
-- Avoid horror monster anatomy, slimy realism, extra random limbs, unreadable silhouettes, or overly
-  detailed animal textures.
-- Avoid realistic animal proportions, long naturalistic bodies, detailed fur, small realistic eyes,
-  and documentary-photo accuracy. Make the animal cuter, rounder, simpler, and more iconic.
+Composition and background:
+- Exactly one clean standalone character-style cutout, centered with generous transparent margin.
+- Full body when possible; use a three-quarter crop only when the source photo is cropped that way.
+- Transparent background only.
+- No beach, room, scenery, floor, ground plane, base, cast shadow, contact shadow, mirror reflection,
+  glossy floor reflection, frame, UI, text, label, watermark, sticker sheet, collage, or duplicate
+  character.
 
-Desktop pet source layout:
-- Include exactly one complete character only.
-- The character must be upright or naturally grounded, front-facing or 3/4 view, suitable for later
-  idle, walk, sleep, happy, and work animations.
-- Use transparent background if possible. If transparency is not supported, use a plain solid
-  background that can be removed cleanly.
-- Leave clear empty margin around the character and keep the feet/base aligned near the bottom.
-- Do not create a design sheet, contact sheet, sticker sheet, collage, multiple poses, multiple
-  heads, detail callouts, expression icons, props floating around the character, or duplicate
-  versions of the character.
-- Do not add text, labels, speech bubbles, watermarks, frames, UI, or decorative background scenes.
-- Preserve a distinctive source pose only if it still reads as one clean desktop pet character.
-
-Pixel style rules:
-- Use crisp square pixels, no anti-aliased soft edges, no painterly brushwork, no photorealism.
-- Use thick dark/black pixel outlines around the character and major shapes.
-- Use a limited clean palette, usually 6 to 10 colors based on the uploaded outfit, hair, skin/animal
-  color, and animal accents.
-- Use big readable color regions, simple highlights, and a few intentional pixel sparkle/accent blocks.
-- Avoid noisy dithering, over-detailed fabric texture, tiny unreadable accessories, and smooth gradients.
-- Prefer bold cute pixel shapes over accurate texture: stripes, spots, whiskers, scales, or tentacle
-  suckers should be simplified into a few clean, readable accent blocks.
-- The final image must be suitable to convert into a transparent 256x256 desktop pet asset pack.
+Negative style constraints:
+- No photorealism, smooth painterly illustration, fuzzy haze, noisy dithering, muddy texture, dirty
+  smudges, heavy black borders, low-contrast color wash, or realistic skin/fur texture.
+- No invented animal traits, tentacles, ears, tails, wings, or mascot redesign unless requested by
+  the user's current text.
 """.strip()

@@ -5,16 +5,12 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Sequence
 
 from openai import OpenAIError
 
 from image_style_agent import (
-    _client,
-    _extract_image_reference,
-    _message_content_to_text,
-    _save_generated_image,
-    _to_data_url,
+    generate_image_from_reference,
 )
 
 CHARACTER_STORE = Path("characters/characters.json")
@@ -51,6 +47,14 @@ def _image_url_to_path(image_url: str) -> Path:
     return image_path
 
 
+def _static_url_for_path(path: Path) -> str:
+    resolved = path.resolve()
+    static_root = STATIC_DIR.resolve()
+    if resolved != static_root and static_root not in resolved.parents:
+        raise ValueError("生成的参考图必须位于 /static/ 目录下。")
+    return f"{STATIC_PREFIX}{resolved.relative_to(static_root).as_posix()}"
+
+
 def _content_type_for_path(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".jpg", ".jpeg"}:
@@ -69,11 +73,17 @@ def create_character(
     style_mode: str,
     description: str,
 ) -> dict:
-    _image_url_to_path(image_url)
+    image_path = _image_url_to_path(image_url)
+    walking_reference_image_url = _generate_walking_reference_image(
+        image_path=image_path,
+        style_mode=style_mode,
+        description=description,
+    )
     characters = _load_characters()
     character = {
         "id": uuid.uuid4().hex,
         "image_url": image_url.split("?", 1)[0],
+        "walking_reference_image_url": walking_reference_image_url,
         "style_mode": style_mode,
         "description": description.strip() or "confirmed character",
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -83,20 +93,114 @@ def create_character(
     return character
 
 
-def build_character_desktop_assets(character_id: str) -> dict:
-    from desktop_pet_assets import build_desktop_pet_assets
+def _walking_reference_prompt(style_mode: str, description: str) -> str:
+    style_note = (
+        "Use the same refined chibi 2D pixel-art sprite style: thick clean pixel outline, crisp square "
+        "pixels, flat readable colors, cute expressive proportions, and polished game-sprite finish."
+    )
+    if style_mode == "figurine_3d":
+        style_note = "Use the same 3D voxel pixel-block figurine style and simplified toy-like parts."
+
+    return f"""
+Use the uploaded confirmed character image as the locked identity reference.
+Generate one standalone species-accurate locomotion reference image for later desktop-pet walk animation.
+
+Character notes:
+{description.strip() or "confirmed character"}
+
+Pose requirement:
+- Change the pose into a normal movement-ready pose that fits this character's species and body structure.
+- Do not preserve the reference image's sitting pose, curled pose, object-holding pose, or hand position.
+- The first readable impression must be: this character is ready to move in its natural way.
+- Do not force an animal, octopus, slime, fish, or non-humanoid creature into a human standing pose.
+- Do not invent human legs, human feet, human arms, shoes, or hands for a creature that does not naturally have them.
+- If the character has humanoid arms, arms hang naturally downward and can swing slightly.
+- If the character is a four-legged animal, use a natural four-legged walking-ready pose.
+- If the character is an octopus, squid, slug, snail, or other soft-bodied mollusk, do not make it walk like a human or mammal:
+  make its arms/tentacles crawl or its soft body glide along the ground, with several arms/tentacles touching the ground as the moving base.
+- If the character is an octopus or tentacled creature, keep the tentacles and use tentacle-supported crawling/gliding locomotion:
+  several tentacles touch the ground as the moving base, with other tentacles slightly lifted for the next step.
+- If the character is a fish, use tail-fin swimming locomotion: the tail and tail fin swing side to side, the body gently undulates,
+  and no legs, feet, shoes, or walking stride are added.
+- If the character is another animal or creature without arms, use its natural locomotion posture and do not add arms.
+- Preserve the same identity, colors, outfit, markings, face, species/creature traits, and proportions as much as possible.
+
+Style rules:
+{style_note}
+
+Output contract:
+- Transparent PNG only, with a real alpha channel.
+- One complete character only, centered on a square canvas.
+- Full body or full readable silhouette visible with clean empty transparent margin.
+- No background, scene, floor, shadow, reflection, glow, text, labels, UI, duplicate character, or sprite sheet.
+""".strip()
+
+
+def _generate_walking_reference_image(
+    *,
+    image_path: Path,
+    style_mode: str,
+    description: str,
+) -> str:
+    try:
+        generated_name = generate_image_from_reference(
+            image_bytes=image_path.read_bytes(),
+            filename=image_path.name,
+            content_type=_content_type_for_path(image_path),
+            prompt=_walking_reference_prompt(style_mode, description),
+            size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
+            require_transparent_png=True,
+        )
+    except OpenAIError as exc:
+        raise ValueError(f"GPT 生成站立行走参考图失败：{exc}") from exc
+    return f"{STATIC_PREFIX}generated/{generated_name}"
+
+
+def build_character_desktop_assets(
+    character_id: str,
+    animation_names: Optional[Sequence[str]] = None,
+    provider: Optional[str] = None,
+) -> dict:
+    from desktop_pet_assets import build_desktop_pet_assets, publish_existing_behavior_assets
+
+    asset_provider = (provider or os.getenv("DESKTOP_PET_ASSET_PROVIDER", "wan")).strip().lower()
+    if asset_provider not in {"wan", "gpt"}:
+        raise ValueError("桌宠动作素材 provider 只能是 wan 或 gpt。")
+    frame_generator = (
+        _generate_wan_desktop_behavior_frames
+        if asset_provider == "wan"
+        else _generate_desktop_behavior_frames
+    )
 
     characters = _load_characters()
     for character in characters:
         if character["id"] == character_id:
-            assets = build_desktop_pet_assets(
+            if asset_provider == "wan" and _needs_walking_reference(animation_names) and not character.get(
+                "walking_reference_image_url"
+            ):
+                image_path = _image_url_to_path(character["image_url"])
+                character["walking_reference_image_url"] = _generate_walking_reference_image(
+                    image_path=image_path,
+                    style_mode=character.get("style_mode", ""),
+                    description=character.get("description", ""),
+                )
+            build_desktop_pet_assets(
                 character,
-                pose_image_generator=_generate_desktop_behavior_pose,
+                frame_sequence_generator=frame_generator,
+                animation_names=animation_names,
             )
+            assets = publish_existing_behavior_assets(character)
+            assets["desktop_pet_asset_provider"] = asset_provider
             character.update(assets)
             _save_characters(characters)
             return character
     raise ValueError("角色不存在。")
+
+
+def _needs_walking_reference(animation_names: Optional[Sequence[str]]) -> bool:
+    if animation_names is None:
+        return True
+    return bool({"walk_left", "walk_right"} & set(animation_names))
 
 
 def _find_character(character_id: str) -> dict:
@@ -142,6 +246,34 @@ asks for text.
 """.strip()
 
 
+STICKER_PACK_PROMPTS = [
+    "开心打招呼，适合说你好",
+    "害羞贴贴，适合表达喜欢",
+    "震惊睁大眼，适合表达不可思议",
+    "委屈快哭了，适合撒娇",
+    "生气鼓脸，适合表达小脾气",
+    "困到打哈欠，适合说想睡了",
+    "认真点头，适合表示收到",
+    "疑惑歪头，适合表达不懂",
+    "加油挥拳，适合鼓励主人",
+    "瘫倒休息，适合表达累了",
+    "抱着爱心，适合表达感谢和喜欢",
+    "偷偷探头，适合轻轻出现或围观",
+]
+
+
+def _sticker_prompt(character: dict, sticker_prompt: str, theme: str) -> str:
+    theme_note = theme.strip() or "日常聊天表情包"
+    return _event_prompt(
+        character,
+        (
+            f"生成一张宠物聊天表情包：{sticker_prompt}。\n"
+            f"表情包主题：{theme_note}。\n"
+            "单张贴纸构图，角色占主体，动作和表情清晰，适合 Telegram 聊天中发送。"
+        ),
+    )
+
+
 def _desktop_pose_prompt(character: dict, action_prompt: str) -> str:
     return f"""
 Use the uploaded confirmed desktop pet character as the identity reference.
@@ -158,54 +290,138 @@ Character notes:
 
 Desktop sprite contract:
 - One complete character only, centered on a square canvas.
-- Transparent background if possible; otherwise one plain removable solid background.
+- Transparent PNG only, with a real alpha channel. Only the character may be visible.
+- All four corners and the margin around the character must be fully transparent.
 - Full body or full readable sleeping/lying silhouette visible with clean empty margin.
 - Thick pixel outline, clean flat colors, crisp square-pixel 2D game-sprite style.
-- No character sheet, pose grid, duplicate characters, captions, UI, speech bubbles, frames, or scene
-  background.
+- No white/gray/checkerboard/solid matte background, character sheet, pose grid, duplicate characters,
+  captions, UI, speech bubbles, frames, scene background, ground, shadow, glow, reflection, or halo.
+""".strip()
+
+
+def _desktop_frame_prompt(character: dict, spec: Any, frame_index: int) -> str:
+    frame_direction = ""
+    if spec.name == "idle":
+        idle_moments = {
+            1: "tilt the upper body gently toward the left",
+            2: "ease the upper body back toward the center as a transition frame",
+            3: "tilt the upper body gently toward the right",
+            4: "ease the upper body back toward the center as a transition frame",
+        }
+        detail = idle_moments.get(frame_index, "keep the seated idle sway subtle")
+        frame_direction = (
+            f"\nIdle frame detail: draw the character sitting. Keep the seated lower body/base fixed. "
+            f"In this frame, {detail}. "
+            "Do not move the character's position on the canvas."
+        )
+
+    return f"""
+Use the uploaded confirmed desktop pet character as a locked identity reference.
+Generate frame {frame_index} of {spec.frame_count} as a standalone complete transparent PNG for this desktop-pet behavior:
+{spec.prompt.strip()}
+{frame_direction}
+
+The pet identity is fixed. This single frame must keep the same species, face, silhouette, body
+proportions, fur shape, colors, markings, accessories, and overall 2D pixel-art style as the reference
+image. Do not redesign, recolor, simplify into a different animal, add new clothing, or change the
+pet's age.
+
+Animation requirements:
+- This is one complete frame in a {spec.frame_count}-frame action sequence.
+- Show the frame-specific moment for frame {frame_index}: keep scale, foot/base anchor, and character
+  size consistent with the other frames.
+- The desktop host app moves the Swift window across the screen. Do not simulate travel by shifting
+  the pet left or right inside the PNG frames.
+- Keep the pet's center point and bottom contact/visual anchor fixed in the same canvas position for
+  every frame. Walking frames must be an in-place stepping loop, not a traveling sprite.
+- Do not create a sprite sheet, strip, collage, grid, multiple frames, or multiple copies.
+- For idle/relax, use a small breathing or posture variation.
+- For idle specifically, use four frames total: all frames are seated; frame 1 tilts the upper body
+  gently left, frame 2 transitions back toward center, frame 3 tilts the upper body gently right,
+  frame 4 transitions back toward center, and the seated base anchor stays fixed.
+- For walking, use a readable in-place stepping-cycle pose for this frame.
+- For happy/play/feed/refill/pet/clean/lullaby/work/alert/sleep, make this frame's behavior readable
+  through body pose and expression while staying consistent with the other frames.
+
+Character notes:
+{character.get("description", "")}
+
+Single-frame contract:
+- Family-friendly, non-sexualized desktop mascot sprite. Preserve the outfit as a cute costume, but
+  avoid revealing, suggestive, romantic, or adult framing.
+- Output exactly one complete pet, centered with clean empty margin.
+- Transparent PNG only, with a real alpha channel. Only the pet pixels may be visible.
+- All four corners and the margin around the pet must be fully transparent.
+- Thick pixel outline, clean flat colors, crisp square-pixel 2D game-sprite style.
+- No white/gray/checkerboard/solid matte background, character sheet labels, captions, UI, speech
+  bubbles, decorative scene background, ground, shadow, glow, reflection, halo, extra characters, or
+  duplicate pets.
 """.strip()
 
 
 def _generate_desktop_behavior_pose(character: dict, spec: Any, output_dir: Path) -> Path:
     image_path = _image_url_to_path(character["image_url"])
     try:
-        response = _client().chat.completions.create(
-            model=os.getenv("POE_IMAGE_MODEL", "gpt-image-1.5"),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _desktop_pose_prompt(character, spec.prompt)},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": _to_data_url(
-                                    image_path.read_bytes(),
-                                    _content_type_for_path(image_path),
-                                )
-                            },
-                        },
-                    ],
-                }
-            ],
-            stream=False,
-            extra_body={
-                "aspect": os.getenv("POE_IMAGE_ASPECT", "1:1"),
-                "quality": os.getenv("POE_IMAGE_QUALITY", "high"),
-            },
+        generated_name = generate_image_from_reference(
+            image_bytes=image_path.read_bytes(),
+            filename=image_path.name,
+            content_type=_content_type_for_path(image_path),
+            prompt=_desktop_pose_prompt(character, spec.prompt),
+            size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
+            require_transparent_png=True,
         )
     except OpenAIError as exc:
-        raise ValueError(f"Poe 图片模型生成 {spec.name} 姿态失败：{exc}") from exc
+        raise ValueError(f"OpenAI 图片模型生成 {spec.name} 姿态失败：{exc}") from exc
 
-    if not response.choices:
-        raise ValueError(f"图片模型没有返回 {spec.name} 姿态结果。")
-
-    response_text = _message_content_to_text(response.choices[0].message.content)
-    generated_name = _save_generated_image(_extract_image_reference(response_text))
     generated_path = (STATIC_DIR / "generated" / generated_name).resolve()
     pose_path = output_dir / f"{spec.pose_name}_model_pose{generated_path.suffix.lower() or '.png'}"
     pose_path.write_bytes(generated_path.read_bytes())
     return pose_path
+
+
+def _generate_desktop_behavior_frames(character: dict, spec: Any, output_dir: Path) -> list[Path]:
+    image_path = _image_url_to_path(character["image_url"])
+    frame_paths = []
+    for frame_index in range(1, spec.frame_count + 1):
+        try:
+            generated_name = generate_image_from_reference(
+                image_bytes=image_path.read_bytes(),
+                filename=image_path.name,
+                content_type=_content_type_for_path(image_path),
+                prompt=_desktop_frame_prompt(character, spec, frame_index),
+                size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
+                require_transparent_png=True,
+            )
+        except OpenAIError as exc:
+            raise ValueError(f"OpenAI 图片模型生成 {spec.name} 第 {frame_index} 帧失败：{exc}") from exc
+
+        generated_path = (STATIC_DIR / "generated" / generated_name).resolve()
+        frame_path = output_dir / f"{spec.pose_name}_model_frame_{frame_index}.png"
+        frame_path.write_bytes(generated_path.read_bytes())
+        frame_paths.append(frame_path)
+    return frame_paths
+
+
+def _generate_wan_desktop_behavior_frames(character: dict, spec: Any, output_dir: Path) -> list[Path]:
+    from wan_video_agent import generate_wan_animation_gif
+
+    image_url = character["image_url"]
+    if spec.name in {"walk_left", "walk_right"}:
+        image_url = character.get("walking_reference_image_url") or image_url
+    elif spec.name == "sleep":
+        sleep_reference_path = _generate_desktop_behavior_pose(character, spec, output_dir)
+        image_url = _static_url_for_path(sleep_reference_path)
+
+    try:
+        return generate_wan_animation_gif(
+            image_url=image_url,
+            animation_name=spec.name,
+            output_dir=output_dir,
+            frame_count=spec.frame_count,
+            duration_ms=spec.duration,
+        )
+    except ValueError as exc:
+        raise ValueError(f"Wan 图生视频生成 {spec.name} 动作 GIF 失败：{exc}") from exc
 
 
 def generate_character_event(character_id: str, event_prompt: str) -> dict:
@@ -215,42 +431,59 @@ def generate_character_event(character_id: str, event_prompt: str) -> dict:
     character = _find_character(character_id)
     image_path = _image_url_to_path(character["image_url"])
     try:
-        response = _client().chat.completions.create(
-            model=os.getenv("POE_IMAGE_MODEL", "gpt-image-1.5"),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _event_prompt(character, event_prompt)},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": _to_data_url(
-                                    image_path.read_bytes(),
-                                    _content_type_for_path(image_path),
-                                )
-                            },
-                        },
-                    ],
-                }
-            ],
-            stream=False,
-            extra_body={
-                "aspect": os.getenv("POE_IMAGE_ASPECT", "1:1"),
-                "quality": os.getenv("POE_IMAGE_QUALITY", "high"),
-            },
+        output_name = generate_image_from_reference(
+            image_bytes=image_path.read_bytes(),
+            filename=image_path.name,
+            content_type=_content_type_for_path(image_path),
+            prompt=_event_prompt(character, event_prompt),
+            size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
         )
     except OpenAIError as exc:
-        raise ValueError(f"Poe 图片模型调用失败：{exc}") from exc
+        raise ValueError(f"OpenAI 图片模型调用失败：{exc}") from exc
 
-    if not response.choices:
-        raise ValueError("图片模型没有返回结果。")
-
-    response_text = _message_content_to_text(response.choices[0].message.content)
-    output_name = _save_generated_image(_extract_image_reference(response_text))
     return {
         "image_url": f"/static/generated/{output_name}",
         "filename": output_name,
         "character_id": character_id,
         "prompt": event_prompt.strip(),
+    }
+
+
+def generate_character_sticker_pack(character_id: str, theme: str = "") -> dict:
+    character = _find_character(character_id)
+    image_path = _image_url_to_path(character["image_url"])
+    stickers = []
+    for index, prompt in enumerate(STICKER_PACK_PROMPTS, start=1):
+        try:
+            output_name = generate_image_from_reference(
+                image_bytes=image_path.read_bytes(),
+                filename=image_path.name,
+                content_type=_content_type_for_path(image_path),
+                prompt=_sticker_prompt(character, prompt, theme),
+                size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
+            )
+        except OpenAIError as exc:
+            raise ValueError(f"OpenAI 图片模型生成第 {index} 张表情包失败：{exc}") from exc
+        stickers.append(
+            {
+                "index": index,
+                "image_url": f"/static/generated/{output_name}",
+                "filename": output_name,
+                "prompt": prompt,
+            }
+        )
+
+    characters = _load_characters()
+    for stored in characters:
+        if stored["id"] == character_id:
+            stored["sticker_pack"] = stickers
+            stored["sticker_pack_theme"] = theme.strip() or "日常聊天表情包"
+            stored["sticker_pack_created_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            _save_characters(characters)
+            break
+
+    return {
+        "character_id": character_id,
+        "theme": theme.strip() or "日常聊天表情包",
+        "stickers": stickers,
     }

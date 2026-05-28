@@ -7,6 +7,7 @@ Slash commands are kept only as debug/bootstrap fallbacks.
 
 import os
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -15,6 +16,7 @@ import requests
 from dotenv import load_dotenv
 
 from diagnostics import log_event, log_exception, new_trace_id
+from desktop_pet_assets import BASIC_DESKTOP_ANIMATION_NAMES
 from pet_runtime_controller import controller_from_env
 from pet_status_service import format_action_reply, format_pet_status
 
@@ -23,9 +25,52 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ALLOWED_OWNER_CHAT_IDS = {
+    chat_id.strip()
+    for chat_id in os.getenv("TELEGRAM_ALLOWED_OWNER_CHAT_IDS", "").split(",")
+    if chat_id.strip()
+}
 API_BASE_URL = os.getenv("PET_AGENT_API_URL", "http://127.0.0.1:8000")
 DEFAULT_PET_ID = os.getenv("PET_AGENT_DEFAULT_PET_ID", "")
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+AVATAR_PREVIEW_PROGRESS_STAGES = [
+    "收到设定，正在整理宠物形象线索",
+    "正在生成轮廓和整体气质",
+    "正在补充颜色、表情和特征",
+    "正在检查是否适合做成桌宠",
+    "预览快好了，正在保存结果",
+]
+AVATAR_STYLE_LOCK_RULE = (
+    "固定使用精致 Q 版二次元像素艺术画风；透明背景；无地面、无倒影、无投影、无场景。"
+    "只转换上传图片的画风，保留主体、姿势、服装、颜色和手持物，不套用旧宠物或动物化设定。"
+)
+AVATAR_PREVIEW_MAX_CONCURRENT = 1
+AVATAR_PROGRESS_INTERVAL_SECONDS = 5
+AVATAR_PROGRESS_HEARTBEAT_SECONDS = 30
+AVATAR_PROGRESS_SLOW_SECONDS = 90
+AVATAR_PROGRESS_TIMEOUT_SECONDS = 180
+AVATAR_ASSET_GENERATION_TIMEOUT_SECONDS = 900
+AVATAR_ASSET_ANIMATION_LABELS = {
+    "idle": "待机",
+    "relax": "放松",
+    "walk_right": "向右走",
+    "walk_left": "向左走",
+    "sleep": "睡觉",
+    "happy": "开心",
+}
+STICKER_PACK_SIZE = 12
+PET_SPECIES_LABELS = {
+    "cat": "猫",
+    "dog": "狗",
+    "other": "其他",
+}
+PET_PERSONALITY_LABELS = {
+    "sweet": "甜甜",
+    "cool": "酷酷",
+    "energetic": "活泼",
+    "gentle": "温柔",
+}
 
 
 SET_FIELD_MAP = {
@@ -36,9 +81,39 @@ SET_FIELD_MAP = {
     "mode": "pet_mode",
 }
 
-PENDING_SET_FIELDS: dict[str, str] = {}
+PENDING_SET_FIELDS: dict[str, dict[str, Any]] = {}
 PENDING_AVATAR_FLOWS: dict[str, dict[str, Any]] = {}
+PENDING_PET_FLOWS: dict[str, dict[str, Any]] = {}
+PENDING_RELATIONSHIP_FLOWS: dict[str, dict[str, Any]] = {}
+PENDING_MEMORY_PHOTO_FLOWS: dict[str, dict[str, Any]] = {}
+CURRENT_PET_IDS: dict[str, int] = {}
+OWNER_IDS_BY_CHAT: dict[str, int] = {}
+ACTIVE_PET_GROUP_CHATS: set[str] = set()
+PET_GROUP_LAST_SPEAKER_IDS: dict[str, list[int]] = {}
+ACTIVE_AVATAR_GENERATIONS: dict[str, object] = {}
+AVATAR_GENERATION_LOCK = threading.Lock()
+AVATAR_GENERATION_SEMAPHORE = threading.BoundedSemaphore(AVATAR_PREVIEW_MAX_CONCURRENT)
 RUNTIME_CONTROLLER = controller_from_env(PROJECT_ROOT)
+
+RELATIONSHIP_LABEL_OPTIONS: list[tuple[str, str]] = [
+    ("爱接 TA 的话", "often_replies_to_target"),
+    ("喜欢靠近 TA", "likes_staying_near_target"),
+    ("在 TA 旁边很安静", "quiet_around_target"),
+    ("常拉 TA 一起玩", "pulls_target_to_play"),
+    ("会和 TA 保持距离", "keeps_distance_from_target"),
+]
+
+RELATIONSHIP_LABEL_TEXT = {
+    key: text for text, key in RELATIONSHIP_LABEL_OPTIONS
+}
+RELATIONSHIP_EXPRESSION_COOLDOWN_SECONDS = {
+    "often_replies_to_target": 180.0,
+    "likes_staying_near_target": 300.0,
+    "pulls_target_to_play": 360.0,
+    "quiet_around_target": 600.0,
+    "keeps_distance_from_target": 600.0,
+}
+RELATIONSHIP_EXPRESSION_COOLDOWNS: dict[tuple[int, int, str], float] = {}
 
 
 def inline_keyboard(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
@@ -52,20 +127,16 @@ def inline_keyboard(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
 
 SETTINGS_MENU = inline_keyboard(
     [
-        [("设置名字", "prompt_set:name"), ("主人称呼", "prompt_set:owner_call")],
-        [("甜甜", "set:personality:sweet"), ("酷酷", "set:personality:cool")],
-        [("活泼", "set:personality:energetic"), ("温柔", "set:personality:gentle")],
-        [("电子宠物", "set:mode:virtual"), ("真实宠物", "set:mode:real")],
-        [("猫", "set:species:cat"), ("狗", "set:species:dog"), ("其他", "set:species:other")],
-        [("定制形象", "set:avatar"), ("返回主菜单", "menu")],
+        [("打开宠物列表", "pets")],
+        [("返回主菜单", "menu")],
     ]
 )
 
 MAIN_REPLY_KEYBOARD = {
     "keyboard": [
         [{"text": "查看状态"}, {"text": "桌面陪伴"}],
-        [{"text": "宠物列表"}],
-        [{"text": "设置资料"}, {"text": "定制形象"}],
+        [{"text": "宠物列表"}, {"text": "宠物关系"}],
+        [{"text": "创建宠物"}],
         [{"text": "喂饭"}, {"text": "加水"}, {"text": "陪玩"}],
         [{"text": "摸摸"}, {"text": "清洁"}, {"text": "哄睡"}],
     ],
@@ -91,15 +162,6 @@ ACTION_LABELS = {
     "lullaby": "哄睡",
 }
 
-MAIN_INLINE_MENU = inline_keyboard(
-    [
-        [("桌面陪伴", "desktop"), ("查看状态", "status")],
-        [("定制形象", "set:avatar"), ("设置资料", "settings")],
-        [("喂饭", "act:feed"), ("加水", "act:refill"), ("陪玩", "act:play")],
-        [("摸摸", "act:pet"), ("清洁", "act:clean"), ("哄睡", "act:lullaby")],
-    ]
-)
-
 AVATAR_STYLE_PRESETS = {
     "octopus": "章鱼宠物，2D 像素风，单个正立角色，保留参考图的主色和气质，适合桌面宠物。",
     "cat": "猫猫宠物，2D 像素风，单个正立角色，保留参考图的主色和气质，适合桌面宠物。",
@@ -111,6 +173,7 @@ AVATAR_STYLE_PRESETS = {
 def telegram_api(method: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+    response: Optional[requests.Response] = None
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
@@ -118,8 +181,62 @@ def telegram_api(method: str, payload: Optional[dict[str, Any]] = None) -> dict[
             timeout=30,
         )
         response.raise_for_status()
-    except requests.RequestException:
-        raise RuntimeError(f"Telegram {method} failed") from None
+    except requests.RequestException as exc:
+        detail = str(exc)
+        if response is not None:
+            detail = f"{response.status_code} {response.text[:300]}"
+        raise RuntimeError(f"Telegram {method} failed: {detail}") from None
+    return response.json()
+
+
+def owner_scoping_enabled() -> bool:
+    return bool(ALLOWED_OWNER_CHAT_IDS)
+
+
+def is_chat_allowed(chat_id: str) -> bool:
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return False
+    if ALLOWED_OWNER_CHAT_IDS and chat_id not in ALLOWED_OWNER_CHAT_IDS:
+        return False
+    return True
+
+
+def ensure_owner_id(chat_id: str) -> Optional[int]:
+    if not owner_scoping_enabled():
+        return None
+    if chat_id in OWNER_IDS_BY_CHAT:
+        return OWNER_IDS_BY_CHAT[chat_id]
+    response = requests.post(
+        f"{API_BASE_URL}/owners/telegram",
+        json={"telegram_chat_id": chat_id, "display_name": ""},
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    owner_id = int(response.json()["id"])
+    OWNER_IDS_BY_CHAT[chat_id] = owner_id
+    return owner_id
+
+
+def owner_params(chat_id: str) -> dict[str, int]:
+    owner_id = ensure_owner_id(chat_id)
+    return {"owner_id": owner_id} if owner_id is not None else {}
+
+
+def owner_params_kwarg(chat_id: Optional[str]) -> dict[str, dict[str, int]]:
+    if chat_id is None:
+        return {}
+    params = owner_params(chat_id)
+    return {"params": params} if params else {}
+
+
+def api_get_pets(chat_id: str) -> list[dict[str, Any]]:
+    response = requests.get(
+        f"{API_BASE_URL}/pets",
+        **owner_params_kwarg(chat_id),
+        timeout=10,
+    )
+    response.raise_for_status()
     return response.json()
 
 
@@ -127,17 +244,186 @@ def send_message(
     chat_id: str,
     text: str,
     reply_markup: Optional[dict[str, Any]] = None,
-) -> None:
+) -> dict[str, Any]:
     payload = {
         "chat_id": chat_id,
         "text": text,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    telegram_api(
+    return telegram_api(
         "sendMessage",
         payload,
     )
+
+
+def remove_reply_keyboard(chat_id: str, text: str = "正在刷新底部键盘。") -> dict[str, Any]:
+    return send_message(
+        chat_id,
+        text,
+        reply_markup={"remove_keyboard": True},
+    )
+
+
+def edit_message_text(
+    chat_id: str,
+    message_id: int,
+    text: str,
+    reply_markup: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api("editMessageText", payload)
+
+
+def _telegram_message_id(response: dict[str, Any]) -> Optional[int]:
+    try:
+        return int(response["result"]["message_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _progress_bar(step: int, total: int) -> str:
+    done = max(0, min(step, total))
+    return "▰" * done + "▱" * (total - done)
+
+
+def format_avatar_progress_text(stage: str, trace_id: object, step: int, total: int = 5) -> str:
+    return (
+        f"{_progress_bar(step, total)} {step}/{total}\n"
+        f"{stage}\n\n"
+        "生成形象预览通常需要 30-90 秒，我会在这里更新进度。\n"
+        f"当前阶段：生成预览\n调试编号：{trace_id}"
+    )
+
+
+def format_avatar_progress_heartbeat_text(trace_id: object, elapsed_seconds: float) -> str:
+    elapsed = int(elapsed_seconds)
+    if elapsed >= AVATAR_PROGRESS_TIMEOUT_SECONDS:
+        status = "已经超过常规等待时间，我还在等生成接口返回；如果失败会在这里说明原因。"
+    elif elapsed >= AVATAR_PROGRESS_SLOW_SECONDS:
+        status = "这次比平时慢，我还在持续等待生成结果。"
+    else:
+        status = "预览仍在生成中，我还在等结果返回。"
+    return (
+        f"{_progress_bar(5, 5)} 5/5\n"
+        f"{status}\n\n"
+        f"已等待：{elapsed} 秒\n"
+        "其他底部按钮仍然可以继续使用。\n"
+        f"当前阶段：生成预览\n调试编号：{trace_id}"
+    )
+
+
+def format_avatar_busy_text(flow: dict[str, Any]) -> str:
+    trace_id = flow.get("trace_id", "unknown")
+    started_at = flow.get("started_at")
+    elapsed = ""
+    if isinstance(started_at, (int, float)):
+        elapsed = f"\n已等待：{int(time.monotonic() - started_at)} 秒"
+    return (
+        "还在生成中。这只宠物的形象预览已经在生成中，我不会重复提交，避免把生成服务拖卡。\n"
+        "我会继续更新上面的进度消息；你也可以先使用其他功能。"
+        f"{elapsed}\n调试编号：{trace_id}"
+    )
+
+
+def format_avatar_failure_text(trace_id: object, error: object) -> str:
+    error_text = str(error)
+    if "insufficient_quota" in error_text or "used up your points" in error_text:
+        reason = "图片生成额度不足，模型服务拒绝了这次请求。"
+    elif "timed out" in error_text.lower() or "timeout" in error_text.lower():
+        reason = "图片生成接口等待超时。"
+    else:
+        reason = error_text
+    return (
+        "生成预览失败。\n"
+        "阶段：生成形象预览\n"
+        f"原因：{reason}\n"
+        f"调试编号：{trace_id}"
+    )
+
+
+def _avatar_flow_is_generating(flow: Optional[dict[str, Any]]) -> bool:
+    return bool(flow and flow.get("step") in {"generating_preview", "revising_preview"})
+
+
+def _acquire_avatar_generation_slot(chat_id: str, trace_id: object) -> bool:
+    with AVATAR_GENERATION_LOCK:
+        if chat_id in ACTIVE_AVATAR_GENERATIONS:
+            return False
+        if not AVATAR_GENERATION_SEMAPHORE.acquire(blocking=False):
+            return False
+        ACTIVE_AVATAR_GENERATIONS[chat_id] = trace_id
+        return True
+
+
+def _release_avatar_generation_slot(chat_id: str, trace_id: object) -> None:
+    with AVATAR_GENERATION_LOCK:
+        if ACTIVE_AVATAR_GENERATIONS.get(chat_id) != trace_id:
+            return
+        ACTIVE_AVATAR_GENERATIONS.pop(chat_id, None)
+        AVATAR_GENERATION_SEMAPHORE.release()
+
+
+def start_avatar_progress_updater(
+    chat_id: str,
+    message_id: Optional[int],
+    trace_id: object,
+    interval_seconds: float = AVATAR_PROGRESS_INTERVAL_SECONDS,
+) -> threading.Event:
+    stop_event = threading.Event()
+    if message_id is None:
+        return stop_event
+
+    def _run() -> None:
+        started_at = time.monotonic()
+        last_heartbeat_at = started_at
+        total = len(AVATAR_PREVIEW_PROGRESS_STAGES)
+        for index, stage in enumerate(AVATAR_PREVIEW_PROGRESS_STAGES[1:], start=2):
+            if stop_event.wait(interval_seconds):
+                return
+            send_chat_action(chat_id, "upload_photo")
+            try:
+                edit_message_text(
+                    chat_id,
+                    message_id,
+                    format_avatar_progress_text(stage, trace_id, index, total),
+                )
+            except RuntimeError as exc:
+                log_exception(
+                    "avatar_progress_update_failed",
+                    trace_id,
+                    exc,
+                    chat_id=chat_id,
+                    step=index,
+                )
+        while not stop_event.wait(interval_seconds):
+            send_chat_action(chat_id, "upload_photo")
+            now = time.monotonic()
+            if now - last_heartbeat_at < AVATAR_PROGRESS_HEARTBEAT_SECONDS:
+                continue
+            last_heartbeat_at = now
+            try:
+                edit_message_text(
+                    chat_id,
+                    message_id,
+                    format_avatar_progress_heartbeat_text(trace_id, now - started_at),
+                )
+            except RuntimeError as exc:
+                log_exception(
+                    "avatar_progress_heartbeat_failed",
+                    trace_id,
+                    exc,
+                    chat_id=chat_id,
+                )
+
+    threading.Thread(target=_run, daemon=True).start()
+    return stop_event
 
 
 def send_photo(
@@ -212,7 +498,10 @@ def answer_callback(callback_query_id: str) -> None:
 
 def configure_bot_ui() -> None:
     """Hide slash commands and refresh the persistent button keyboard."""
-    telegram_api("deleteMyCommands")
+    try:
+        telegram_api("deleteMyCommands")
+    except RuntimeError as exc:
+        log_exception("telegram_command_cleanup_failed", None, exc)
     if ALLOWED_CHAT_ID:
         send_main_menu(ALLOWED_CHAT_ID)
 
@@ -230,10 +519,48 @@ def get_default_pet_id() -> int:
     return int(virtual_pet["id"])
 
 
-def update_default_pet(field: str, value: str) -> dict[str, Any]:
-    pet_id = get_default_pet_id()
+def get_current_pet_id(chat_id: str) -> int:
+    if chat_id in CURRENT_PET_IDS:
+        return CURRENT_PET_IDS[chat_id]
+    pets = api_get_pets(chat_id)
+    if not pets:
+        raise RuntimeError("No pet exists yet. Create one before using settings.")
+    virtual_pet = next((pet for pet in pets if pet.get("pet_mode") == "virtual"), pets[0])
+    pet_id = int(virtual_pet["id"])
+    CURRENT_PET_IDS[chat_id] = pet_id
+    return pet_id
+
+
+def get_current_pet(chat_id: str) -> dict[str, Any]:
+    pet_id = get_current_pet_id(chat_id)
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is not None:
+        return pet
+    CURRENT_PET_IDS.pop(chat_id, None)
+    pet_id = get_current_pet_id(chat_id)
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        raise RuntimeError(f"找不到正在互动的宠物：{pet_id}")
+    return pet
+
+
+def set_current_pet(chat_id: str, pet_id: int) -> dict[str, Any]:
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        raise RuntimeError(f"找不到宠物：{pet_id}")
+    CURRENT_PET_IDS[chat_id] = int(pet_id)
+    return pet
+
+
+def update_pet_by_id(
+    pet_id: int,
+    field: str,
+    value: str,
+    chat_id: Optional[str] = None,
+) -> dict[str, Any]:
     response = requests.patch(
         f"{API_BASE_URL}/pets/{pet_id}",
+        **owner_params_kwarg(chat_id),
         json={SET_FIELD_MAP[field]: value.strip()},
         timeout=10,
     )
@@ -242,30 +569,66 @@ def update_default_pet(field: str, value: str) -> dict[str, Any]:
     return response.json()
 
 
+def update_current_pet(chat_id: str, field: str, value: str) -> dict[str, Any]:
+    return update_pet_by_id(get_current_pet_id(chat_id), field, value, chat_id=chat_id)
+
+
+def pet_settings_keyboard(pet_id: int) -> dict[str, Any]:
+    return inline_keyboard(
+        [
+            [("设置名字", f"prompt_set:{pet_id}:name"), ("主人称呼", f"prompt_set:{pet_id}:owner_call")],
+            [("补充性格/行为", f"prompt_profile:{pet_id}:personality_behavior")],
+            [("设置说话语气", f"prompt_profile:{pet_id}:speaking_style")],
+            [("电子宠物", f"set_pet:{pet_id}:mode:virtual"), ("真实宠物", f"set_pet:{pet_id}:mode:real")],
+            [("设置种类", f"prompt_profile:{pet_id}:species")],
+            [("返回宠物列表", "pets")],
+        ]
+    )
+
+
 def send_main_menu(chat_id: str) -> None:
+    remove_reply_keyboard(chat_id)
     send_message(chat_id, "Pet Live Agent 已打开。底部键盘已刷新。", reply_markup=MAIN_REPLY_KEYBOARD)
-    send_message(chat_id, "常用操作", reply_markup=MAIN_INLINE_MENU)
+
+
+def show_pet_settings(chat_id: str, pet_id: int) -> None:
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    send_message(
+        chat_id,
+        f"正在设置：{pet['name']}。也可以直接补充它的性格、习惯和行为细节。",
+        reply_markup=pet_settings_keyboard(int(pet["id"])),
+    )
 
 
 def send_settings_menu(chat_id: str) -> None:
-    send_message(chat_id, "要设置哪一项？", reply_markup=SETTINGS_MENU)
+    try:
+        pet = get_current_pet(chat_id)
+        show_pet_settings(chat_id, int(pet["id"]))
+        return
+    except (RuntimeError, requests.RequestException):
+        send_message(chat_id, "请先到「宠物列表」选择一只宠物再设置资料。", reply_markup=MAIN_REPLY_KEYBOARD)
 
 
 def handle_status_command(chat_id: str) -> None:
-    pet_id = get_default_pet_id()
+    pet_id = get_current_pet_id(chat_id)
 
-    pet_response = requests.get(f"{API_BASE_URL}/pets", timeout=10)
-    pet_response.raise_for_status()
-    pets = pet_response.json()
+    pets = api_get_pets(chat_id)
     pet = next((item for item in pets if int(item["id"]) == pet_id), None)
     if not pet:
-        send_message(chat_id, f"找不到默认宠物：{pet_id}")
+        send_message(chat_id, f"找不到正在互动的宠物：{pet_id}")
         return
     if pet.get("pet_mode") != "virtual":
         send_message(chat_id, "这只宠物不是电子宠物，暂时没有实时状态面板。")
         return
 
-    snapshot_response = requests.get(f"{API_BASE_URL}/virtual-pets/{pet_id}", timeout=10)
+    snapshot_response = requests.get(
+        f"{API_BASE_URL}/virtual-pets/{pet_id}",
+        **owner_params_kwarg(chat_id),
+        timeout=10,
+    )
     snapshot_response.raise_for_status()
     stats_response = requests.get(
         f"{API_BASE_URL}/pets/{pet_id}/stats",
@@ -284,19 +647,979 @@ def handle_status_command(chat_id: str) -> None:
     )
 
 
+def pet_profile(pet: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return json.loads(pet.get("profile_json") or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
+def pet_species_label(pet: dict[str, Any], profile: Optional[dict[str, Any]] = None) -> str:
+    data = profile if profile is not None else pet_profile(pet)
+    if data.get("custom_species"):
+        return str(data["custom_species"])
+    species = str(pet.get("species") or "")
+    return PET_SPECIES_LABELS.get(species, species or "未设置")
+
+
+def pet_personality_label(pet: dict[str, Any], profile: Optional[dict[str, Any]] = None) -> str:
+    data = profile if profile is not None else pet_profile(pet)
+    personality = str(pet.get("personality") or "")
+    label = PET_PERSONALITY_LABELS.get(personality, personality or "未设置")
+    description = str(data.get("personality_description") or "").strip()
+    return f"{label}，{description}" if description else label
+
+
+def pet_avatar_status(profile: dict[str, Any]) -> str:
+    if profile.get("desktop_pet_manifest_url"):
+        return "桌宠动作素材已就绪"
+    desktop_assets_status = profile.get("desktop_pet_assets_status")
+    if desktop_assets_status == "failed":
+        return "基础形象可用，动作素材生成失败"
+    if desktop_assets_status == "generating":
+        return "基础形象已生成，动作素材后台生成中"
+    if profile.get("character_id"):
+        return "基础形象已生成，动作素材后台生成中"
+    if profile.get("avatar_image_url"):
+        return "基础形象已生成"
+    return "还没有生成形象"
+
+
+def pet_avatar_button_label(pet: dict[str, Any], profile: dict[str, Any]) -> str:
+    action = "更新形象" if profile.get("avatar_image_url") or profile.get("character_id") else "生成形象"
+    return action
+
+
+def pet_avatar_image_url(profile: dict[str, Any]) -> Optional[str]:
+    return profile.get("desktop_pet_avatar_url") or profile.get("avatar_image_url")
+
+
+def pet_action_keyboard(pet: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    rows = [
+        [
+            ("设为互动对象", f"pet_current:{pet['id']}"),
+            ("单独上桌面", f"desktop:{pet['id']}"),
+        ],
+        [
+            ("设置资料", f"pet_settings:{pet['id']}"),
+        ],
+    ]
+    if profile.get("character_id") and profile.get("sticker_pack_status") not in {"generating", "ready"}:
+        rows.append([("生成表情包", f"stickers:generate:{pet['id']}")])
+    rows.append(
+        [
+            (pet_avatar_button_label(pet, profile), f"set:avatar:{pet['id']}"),
+            ("删除", f"pet_delete:ask:{pet['id']}"),
+        ]
+    )
+    return inline_keyboard(rows)
+
+
+def format_pet_card_text(pet: dict[str, Any], index: int) -> tuple[str, dict[str, Any]]:
+    profile = pet_profile(pet)
+    lines = [
+        f"{index}. {pet['name']}",
+        f"种类：{pet_species_label(pet, profile)}",
+        f"性格：{pet_personality_label(pet, profile)}",
+        f"形象：{pet_avatar_status(profile)}",
+    ]
+    traits = str(profile.get("traits_description") or "").strip()
+    if traits:
+        lines.append(f"特征：{traits}")
+    notes = profile.get("personality_behavior_notes") or []
+    if isinstance(notes, str):
+        notes = [notes]
+    notes = [str(note).strip() for note in notes if str(note).strip()]
+    if notes:
+        lines.append(f"性格行为补充：{'；'.join(notes[-3:])}")
+    speaking_style = str(profile.get("speaking_style_prompt") or "").strip()
+    if speaking_style:
+        lines.append(f"说话语气：{speaking_style}")
+    return "\n".join(lines), profile
+
+
+def send_pet_card(chat_id: str, pet: dict[str, Any], index: int) -> None:
+    text, profile = format_pet_card_text(pet, index)
+    reply_markup = pet_action_keyboard(pet, profile)
+    avatar_url = pet_avatar_image_url(profile)
+    if avatar_url:
+        send_local_photo(chat_id, avatar_url, text, reply_markup=reply_markup)
+        return
+    send_message(chat_id, text, reply_markup=reply_markup)
+
+
 def handle_pets_command(chat_id: str) -> None:
+    pets = api_get_pets(chat_id)
+    if not pets:
+        send_message(chat_id, "还没有宠物。", reply_markup=inline_keyboard([[("创建宠物", "pet_create:start")]]))
+        return
+
+    send_message(chat_id, "宠物清单", reply_markup=inline_keyboard([[("创建宠物", "pet_create:start")]]))
+    for index, pet in enumerate(pets, start=1):
+        send_pet_card(chat_id, pet, index)
+
+
+def handle_pet_group_command(chat_id: str) -> None:
+    pets = api_get_pets(chat_id)
+    if not pets:
+        send_message(chat_id, "还没有宠物。", reply_markup=inline_keyboard([[("创建宠物", "pet_create:start")]]))
+        return
+    ACTIVE_PET_GROUP_CHATS.add(chat_id)
+    current_id = get_current_pet_id(chat_id)
+    intro_markup = None
+    if len(pets) >= 2:
+        intro_markup = inline_keyboard([[("编辑宠物关系", "rel:start")]])
+    send_message(
+        chat_id,
+        "这里就是你和宠物们的群聊。它们的状态消息都会发到这里；底部互动按钮会先照顾你指定的互动对象。",
+        reply_markup=intro_markup,
+    )
+    for index, pet in enumerate(pets, start=1):
+        marker = "（正在互动）" if int(pet["id"]) == current_id else ""
+        text = f"{index}. {pet['name']}{marker}\n种类：{pet_species_label(pet)}"
+        send_message(
+            chat_id,
+            text,
+            reply_markup=inline_keyboard(
+                [[
+                    ("设为互动对象", f"pet_current:{pet['id']}"),
+                    ("单独上桌面", f"desktop:{pet['id']}"),
+                ]]
+            ),
+        )
+
+
+def handle_choose_pet_command(chat_id: str) -> None:
+    handle_pet_group_command(chat_id)
+
+
+def _fetch_pets(chat_id: Optional[str] = None) -> list[dict[str, Any]]:
+    if chat_id is not None:
+        return api_get_pets(chat_id)
     response = requests.get(f"{API_BASE_URL}/pets", timeout=10)
     response.raise_for_status()
-    pets = response.json()
-    lines = [
-        f"{pet['id']}: {pet['name']} ({pet['pet_mode']}, {pet['personality']})"
+    return response.json()
+
+
+def _pet_name_by_id(pets: list[dict[str, Any]], pet_id: int) -> str:
+    pet = next((pet for pet in pets if int(pet["id"]) == int(pet_id)), None)
+    return str(pet.get("name")) if pet else f"宠物 {pet_id}"
+
+
+def start_relationship_flow(chat_id: str) -> None:
+    pets = _fetch_pets(chat_id)
+    if len(pets) < 2:
+        send_message(chat_id, "至少要有两只宠物，才能设置宠物之间的关系。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    PENDING_RELATIONSHIP_FLOWS[chat_id] = {"step": "choose_source"}
+    rows = [[(str(pet["name"]), f"rel:source:{pet['id']}")] for pet in pets]
+    send_message(
+        chat_id,
+        "先选一只宠物：我们要设置它对谁的感觉或习惯？",
+        reply_markup=inline_keyboard(rows),
+    )
+
+
+def choose_relationship_source(chat_id: str, source_id: int) -> None:
+    pets = _fetch_pets(chat_id)
+    source = next((pet for pet in pets if int(pet["id"]) == source_id), None)
+    if source is None:
+        send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    PENDING_RELATIONSHIP_FLOWS[chat_id] = {
+        "step": "choose_target",
+        "from_pet_id": source_id,
+    }
+    rows = [
+        [(str(pet["name"]), f"rel:target:{pet['id']}")]
         for pet in pets
+        if int(pet["id"]) != source_id
     ]
-    send_message(chat_id, "\n".join(lines) if lines else "还没有宠物。")
+    send_message(
+        chat_id,
+        f"要设置 {source['name']} 对哪只宠物的感觉？",
+        reply_markup=inline_keyboard(rows),
+    )
 
 
-def handle_desktop_companion(chat_id: str) -> None:
-    result = RUNTIME_CONTROLLER.launch_desktop_companion(chat_id=chat_id)
+def _relationship_label_rows(selected: list[str]) -> list[list[tuple[str, str]]]:
+    rows: list[list[tuple[str, str]]] = []
+    for text, key in RELATIONSHIP_LABEL_OPTIONS:
+        prefix = "✓ " if key in selected else ""
+        rows.append([(f"{prefix}{text}", f"rel:label:{key}")])
+    rows.append([("选好了", "rel:labels_done"), ("取消", "rel:cancel")])
+    return rows
+
+
+def choose_relationship_target(chat_id: str, target_id: int) -> None:
+    flow = PENDING_RELATIONSHIP_FLOWS.get(chat_id)
+    if not flow or "from_pet_id" not in flow:
+        start_relationship_flow(chat_id)
+        return
+    pets = _fetch_pets(chat_id)
+    source_id = int(flow["from_pet_id"])
+    if source_id == target_id:
+        send_message(chat_id, "不能设置宠物对自己的关系。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    source_name = _pet_name_by_id(pets, source_id)
+    target_name = _pet_name_by_id(pets, target_id)
+    flow.update(
+        {
+            "step": "choose_labels",
+            "to_pet_id": target_id,
+            "selected_labels": [],
+            "from_pet_name": source_name,
+            "to_pet_name": target_name,
+        }
+    )
+    send_message(
+        chat_id,
+        f"{source_name} 对 {target_name} 通常是什么感觉或习惯？可以多选。",
+        reply_markup=inline_keyboard(_relationship_label_rows([])),
+    )
+
+
+def toggle_relationship_label(chat_id: str, label: str) -> None:
+    flow = PENDING_RELATIONSHIP_FLOWS.get(chat_id)
+    if not flow or flow.get("step") != "choose_labels":
+        start_relationship_flow(chat_id)
+        return
+    valid_labels = {key for _text, key in RELATIONSHIP_LABEL_OPTIONS}
+    if label not in valid_labels:
+        send_message(chat_id, "这个关系标签暂时不可用。")
+        return
+    selected = list(flow.get("selected_labels") or [])
+    if label in selected:
+        selected.remove(label)
+    else:
+        selected.append(label)
+    flow["selected_labels"] = selected
+    send_message(
+        chat_id,
+        f"已选择 {len(selected)} 个标签。还可以继续调整。",
+        reply_markup=inline_keyboard(_relationship_label_rows(selected)),
+    )
+
+
+def relationship_labels_done(chat_id: str) -> None:
+    flow = PENDING_RELATIONSHIP_FLOWS.get(chat_id)
+    if not flow or flow.get("step") != "choose_labels":
+        start_relationship_flow(chat_id)
+        return
+    if not flow.get("selected_labels"):
+        send_message(chat_id, "至少先选一个关系标签。")
+        return
+    flow["step"] = "await_note"
+    send_message(
+        chat_id,
+        (
+            f"要不要补一句 {flow['from_pet_name']} 对 {flow['to_pet_name']} 的细节？"
+            "\n可以直接发一句话，也可以跳过。"
+        ),
+        reply_markup=inline_keyboard([[("跳过备注", "rel:note_skip"), ("取消", "rel:cancel")]]),
+    )
+
+
+def _relationship_label_summary(labels: list[str]) -> str:
+    return "、".join(RELATIONSHIP_LABEL_TEXT.get(label, label) for label in labels)
+
+
+def finish_relationship_flow(chat_id: str, note: str = "") -> None:
+    flow = PENDING_RELATIONSHIP_FLOWS.get(chat_id)
+    if not flow or flow.get("step") != "await_note":
+        start_relationship_flow(chat_id)
+        return
+    from_pet_id = int(flow["from_pet_id"])
+    to_pet_id = int(flow["to_pet_id"])
+    labels = list(flow.get("selected_labels") or [])
+    payload = {"labels": labels, "note": note.strip(), "muted": False}
+    try:
+        response = requests.put(
+            f"{API_BASE_URL}/pet-relationships/{from_pet_id}/{to_pet_id}",
+            json=payload,
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(response.text)
+    except (RuntimeError, requests.RequestException) as exc:
+        send_message(chat_id, f"关系保存失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    from_name = str(flow["from_pet_name"])
+    to_name = str(flow["to_pet_name"])
+    PENDING_RELATIONSHIP_FLOWS.pop(chat_id, None)
+    label_summary = _relationship_label_summary(labels)
+    detail = f"\n你写的细节：{note.strip()}" if note.strip() else ""
+    send_message(
+        chat_id,
+        (
+            f"{from_name} 轻轻看了看 {to_name}：我记住啦。\n"
+            f"关系标签：{label_summary}{detail}\n"
+            "以后群聊里，这个关系可能会轻轻影响它们的接话和短反应。"
+        ),
+        reply_markup=inline_keyboard(
+            [
+                [("也设置反方向", f"rel:reverse:{to_pet_id}:{from_pet_id}")],
+                [("查看宠物列表", "pets_group")],
+            ]
+        ),
+    )
+
+
+def handle_relationship_text(chat_id: str, text: str) -> bool:
+    flow = PENDING_RELATIONSHIP_FLOWS.get(chat_id)
+    if not flow or flow.get("step") != "await_note":
+        return False
+    finish_relationship_flow(chat_id, text)
+    return True
+
+
+def build_relationship_context_for_candidates(
+    candidate_pet_ids: list[int],
+    relationships: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return structured relationship summaries relevant to one group-chat turn."""
+    candidate_ids = {int(pet_id) for pet_id in candidate_pet_ids}
+    context: list[dict[str, Any]] = []
+    for relationship in relationships:
+        from_pet_id = int(relationship["from_pet_id"])
+        to_pet_id = int(relationship["to_pet_id"])
+        if from_pet_id not in candidate_ids or to_pet_id not in candidate_ids:
+            continue
+        labels = list(relationship.get("labels") or [])
+        context.append(
+            {
+                "from_pet_id": from_pet_id,
+                "to_pet_id": to_pet_id,
+                "from_pet_name": relationship.get("from_pet_name"),
+                "to_pet_name": relationship.get("to_pet_name"),
+                "labels": labels,
+                "note": relationship.get("note") or "",
+                "allow_natural_expression": not bool(relationship.get("muted")),
+                "constraints": [
+                    "use only as a light adjustment to pet personality",
+                    "do not escalate into an unconfirmed major relationship narrative",
+                ],
+            }
+        )
+    return context
+
+
+def _relationship_expression_blocked_reason(
+    relationship: dict[str, Any],
+    now: float,
+) -> Optional[str]:
+    if relationship.get("muted"):
+        return "muted"
+    from_pet_id = int(relationship["from_pet_id"])
+    to_pet_id = int(relationship["to_pet_id"])
+    labels = list(relationship.get("labels") or [])
+    for label in labels:
+        cooldown_key = (from_pet_id, to_pet_id, str(label))
+        blocked_until = RELATIONSHIP_EXPRESSION_COOLDOWNS.get(cooldown_key, 0.0)
+        if blocked_until > now:
+            return "runtime cooldown"
+    return None
+
+
+def _record_relationship_expression(
+    relationship: dict[str, Any],
+    now: float,
+) -> None:
+    from_pet_id = int(relationship["from_pet_id"])
+    to_pet_id = int(relationship["to_pet_id"])
+    for label in list(relationship.get("labels") or []):
+        cooldown_seconds = RELATIONSHIP_EXPRESSION_COOLDOWN_SECONDS.get(str(label), 300.0)
+        RELATIONSHIP_EXPRESSION_COOLDOWNS[(from_pet_id, to_pet_id, str(label))] = (
+            now + cooldown_seconds
+        )
+
+
+def _relationship_context_item(
+    relationship: dict[str, Any],
+    role: str,
+    allow_natural_expression: bool,
+    blocked_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    item = {
+        "role": role,
+        "from_pet_id": int(relationship["from_pet_id"]),
+        "to_pet_id": int(relationship["to_pet_id"]),
+        "from_pet_name": relationship.get("from_pet_name"),
+        "to_pet_name": relationship.get("to_pet_name"),
+        "labels": list(relationship.get("labels") or []),
+        "note": relationship.get("note") or "",
+        "allow_natural_expression": allow_natural_expression,
+        "constraints": [
+            "use only as a light adjustment to pet personality",
+            "do not escalate into an unconfirmed major relationship narrative",
+        ],
+    }
+    if blocked_reason:
+        item["expression_blocked_reason"] = blocked_reason
+    return item
+
+
+def build_relationship_context_for_turn(
+    speaker_pet_id: int,
+    candidate_pet_ids: list[int],
+    relationships: list[dict[str, Any]],
+    now: Optional[float] = None,
+    record_expression: bool = True,
+) -> list[dict[str, Any]]:
+    """Return relationship context for one speaker using runtime-only cooldown state."""
+    current_time = time.monotonic() if now is None else now
+    speaker_id = int(speaker_pet_id)
+    candidate_ids = {int(pet_id) for pet_id in candidate_pet_ids}
+    if speaker_id not in candidate_ids:
+        return []
+
+    relationship_by_pair = {
+        (int(relationship["from_pet_id"]), int(relationship["to_pet_id"])): relationship
+        for relationship in relationships
+        if int(relationship["from_pet_id"]) in candidate_ids
+        and int(relationship["to_pet_id"]) in candidate_ids
+    }
+    context: list[dict[str, Any]] = []
+    for target_id in sorted(candidate_ids - {speaker_id}):
+        outgoing = relationship_by_pair.get((speaker_id, target_id))
+        incoming = relationship_by_pair.get((target_id, speaker_id))
+        if outgoing:
+            blocked_reason = _relationship_expression_blocked_reason(outgoing, current_time)
+            allow_expression = blocked_reason is None
+            context.append(
+                _relationship_context_item(
+                    outgoing,
+                    role="primary_outgoing",
+                    allow_natural_expression=allow_expression,
+                    blocked_reason=blocked_reason,
+                )
+            )
+            if allow_expression and record_expression:
+                _record_relationship_expression(outgoing, current_time)
+            if incoming:
+                context.append(
+                    _relationship_context_item(
+                        incoming,
+                        role="secondary_reverse",
+                        allow_natural_expression=False,
+                    )
+                )
+        elif incoming:
+            context.append(
+                _relationship_context_item(
+                    incoming,
+                    role="weak_incoming",
+                    allow_natural_expression=False,
+                )
+            )
+    return context
+
+
+def _call_group_chat_llm(
+    messages: list[dict[str, Any]],
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    from llm_openai import openai_llm_call
+
+    return openai_llm_call(messages, tools or [])
+
+
+def _pet_profile_for_prompt(pet: dict[str, Any]) -> dict[str, Any]:
+    profile: dict[str, Any] = {}
+    if pet.get("profile_json"):
+        try:
+            profile = json.loads(pet.get("profile_json") or "{}")
+        except json.JSONDecodeError:
+            profile = {}
+    return {
+        "id": int(pet["id"]),
+        "name": pet.get("name"),
+        "species": pet_species_label(pet),
+        "personality": pet.get("personality"),
+        "owner_call_name": pet.get("owner_call_name"),
+        "personality_description": profile.get("personality_description", ""),
+        "traits_description": profile.get("traits_description", ""),
+        "personality_behavior_notes": profile.get("personality_behavior_notes") or [],
+        "speaking_style_prompt": profile.get("speaking_style_prompt", ""),
+    }
+
+
+def build_pet_group_chat_messages(
+    owner_text: str,
+    speaker: dict[str, Any],
+    pets: list[dict[str, Any]],
+    relationship_context: list[dict[str, Any]],
+    pet_memory_context: Optional[list[dict[str, Any]]] = None,
+    short_reaction: bool = False,
+) -> list[dict[str, Any]]:
+    context = {
+        "speaker": _pet_profile_for_prompt(speaker),
+        "all_pets": [_pet_profile_for_prompt(pet) for pet in pets],
+        "relationship_context": relationship_context,
+        "pet_memory_context": pet_memory_context or [],
+        "owner_message": owner_text,
+        "short_reaction": short_reaction,
+    }
+    system = (
+        "你是多宠物群聊里的单轮发言生成器。"
+        "只替 speaker 这一只宠物说一句中文，不要替所有宠物开会。"
+        "宠物身份和性格永远优先；relationship_context 只作为轻微调味。"
+        "只有 allow_natural_expression 为 true 的关系可以被自然说出来；"
+        "其他关系只能影响语气或接话方向，不能直接宣布关系状态。"
+        "pet_memory_context 是可召回的长期记忆；必须遵守每条 recall_guidance，"
+        "尤其不要把主人分享的现实片段说成宠物亲自在场。"
+        "不要复述秘密或敏感细节。"
+        "不要升级成未确认的大关系叙事，不要说自己在读取标签或规则。"
+        "如果 short_reaction 为 true，只能接一句很短的反应，不能展开完整回答。"
+    )
+    user = (
+        "请根据下面 JSON 生成 speaker 的一句自然回复。"
+        "只输出正文，不要 JSON，不要加解释。"
+        "\n\n上下文 JSON：\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_pet_memory_context_for_prompt(
+    memories: list[dict[str, Any]],
+    speaker_pet_id: int,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return compact durable memory context for one speaking pet."""
+    context: list[dict[str, Any]] = []
+    for memory in memories:
+        participant_pet_ids = [
+            int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+        ]
+        speaker_participates = int(speaker_pet_id) in participant_pet_ids
+        if not speaker_participates and memory.get("memory_type") == "co_experienced":
+            continue
+        context.append(
+            {
+                "id": memory.get("id"),
+                "memory_type": memory.get("memory_type"),
+                "title": memory.get("title") or "",
+                "content": memory.get("content") or "",
+                "source": memory.get("source") or "",
+                "emotional_tone": memory.get("emotional_tone") or "",
+                "participant_pet_ids": participant_pet_ids,
+                "speaker_participates": speaker_participates,
+                "recall_guidance": memory.get("recall_guidance") or "",
+            }
+        )
+        if len(context) >= limit:
+            break
+    return context
+
+
+def fetch_recent_pet_memories(limit: int = 8) -> list[dict[str, Any]]:
+    """Fetch recent durable memories for Telegram group chat prompting."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/pet-memories",
+            params={"limit": limit, "visibility": "home"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+    except StopIteration:
+        return []
+    except Exception as exc:
+        log_exception("pet_memory_fetch_failed", None, exc)
+        return []
+
+
+def _group_chat_text_from_llm(response: dict[str, Any]) -> str:
+    content = response.get("content") or []
+    if not content:
+        return ""
+    text = content[0].get("text", "") if isinstance(content[0], dict) else ""
+    return str(text).strip()
+
+
+def _json_object_from_llm_text(text: str) -> Optional[dict[str, Any]]:
+    value = text.strip()
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        start = value.find("{")
+        end = value.rfind("}")
+        if start == -1 or end <= start:
+            return None
+    try:
+        parsed = json.loads(value[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def build_pet_group_responder_plan_messages(
+    owner_text: str,
+    pets: list[dict[str, Any]],
+    recent_speaker_pet_ids: Optional[list[int]] = None,
+) -> list[dict[str, Any]]:
+    context = {
+        "owner_message": owner_text,
+        "recent_speaker_pet_ids": recent_speaker_pet_ids or [],
+        "pets": [_pet_profile_for_prompt(pet) for pet in pets],
+    }
+    system = (
+        "你是多宠物群聊的回应调度器。"
+        "根据主人这句话，判断哪只宠物需要回应。"
+        "如果主人明确点名某只宠物，优先让被点名的宠物回应。"
+        "如果主人说“其他/别的/另外/剩下”的宠物，优先避开 recent_speaker_pet_ids。"
+        "如果是问所有宠物，可以选择 1 到 2 只最适合回应的宠物。"
+        "只输出 JSON，不要解释。"
+    )
+    user = (
+        "请输出 JSON object，字段为 responder_pet_ids。"
+        "responder_pet_ids 是宠物 id 数组，最多 2 个。"
+        "\n\n上下文 JSON：\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _directly_mentioned_pets(owner_text: str, pets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    mentioned: list[dict[str, Any]] = []
+    for pet in pets:
+        name = str(pet.get("name") or "").strip()
+        if name and name in owner_text:
+            mentioned.append(pet)
+    return mentioned
+
+
+def _asks_for_other_pets(owner_text: str) -> bool:
+    return any(keyword in owner_text for keyword in ("其他", "别的", "另外", "剩下"))
+
+
+def choose_pet_group_responders(
+    owner_text: str,
+    pets: list[dict[str, Any]],
+    current_pet_id: Optional[int],
+    recent_speaker_pet_ids: Optional[list[int]] = None,
+    planner_llm_call: Optional[Any] = None,
+) -> list[dict[str, Any]]:
+    mentioned = _directly_mentioned_pets(owner_text, pets)
+    if mentioned:
+        return mentioned[:2]
+
+    excluded_ids = set(recent_speaker_pet_ids or []) if _asks_for_other_pets(owner_text) else set()
+    candidate_pets = [pet for pet in pets if int(pet["id"]) not in excluded_ids]
+    if not candidate_pets:
+        candidate_pets = pets
+    pet_by_id = {int(pet["id"]): pet for pet in candidate_pets}
+    try:
+        messages = build_pet_group_responder_plan_messages(
+            owner_text,
+            candidate_pets,
+            recent_speaker_pet_ids=recent_speaker_pet_ids,
+        )
+        response = (planner_llm_call or _call_group_chat_llm)(messages, [])
+        plan = _json_object_from_llm_text(_group_chat_text_from_llm(response)) or {}
+        responder_ids = plan.get("responder_pet_ids") or []
+        responders = [
+            pet_by_id[int(pet_id)]
+            for pet_id in responder_ids
+            if int(pet_id) in pet_by_id
+        ]
+        if responders:
+            return responders[:2]
+    except Exception as exc:
+        log_exception("pet_group_chat_planner_failed", None, exc)
+
+    if current_pet_id in pet_by_id:
+        return [pet_by_id[int(current_pet_id)]]
+    return candidate_pets[:1]
+
+
+def build_pet_group_reaction_gate_messages(
+    owner_text: str,
+    primary_speaker: dict[str, Any],
+    primary_reply: str,
+    candidate_reactors: list[dict[str, Any]],
+    reaction_context_by_pet_id: dict[int, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    context = {
+        "owner_message": owner_text,
+        "primary_speaker": _pet_profile_for_prompt(primary_speaker),
+        "primary_reply": primary_reply,
+        "candidate_reactors": [_pet_profile_for_prompt(pet) for pet in candidate_reactors],
+        "reaction_context_by_pet_id": reaction_context_by_pet_id,
+    }
+    system = (
+        "你是多宠物群聊的接话判断器。"
+        "判断主宠物回复后，其他每只候选宠物是否应该短短接一句。"
+        "只有 relationship_context 显示 allow_natural_expression 为 true 时才允许自然接话。"
+        "如果用户明确只问了某一只宠物，通常不要让其他宠物插话。"
+        "接话必须少、短、轻，不要抢主回复。只输出 JSON。"
+    )
+    user = (
+        "请输出 JSON object，字段为 reactions。"
+        "reactions 是数组，每项包含 pet_id 和 should_react。"
+        "可以允许多只宠物短接话，但每只只能很短。"
+        "\n\n上下文 JSON：\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def choose_followup_reactors(
+    owner_text: str,
+    primary_speaker: dict[str, Any],
+    primary_reply: str,
+    pets: list[dict[str, Any]],
+    relationships: list[dict[str, Any]],
+    reaction_gate_llm_call: Optional[Any] = None,
+) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    mentioned = _directly_mentioned_pets(owner_text, pets)
+    if len(mentioned) == 1 and int(mentioned[0]["id"]) == int(primary_speaker["id"]):
+        return []
+
+    candidate_ids = [int(pet["id"]) for pet in pets]
+    candidate_reactors: list[dict[str, Any]] = []
+    reaction_context_by_pet_id: dict[int, list[dict[str, Any]]] = {}
+    for pet in pets:
+        pet_id = int(pet["id"])
+        if pet_id == int(primary_speaker["id"]):
+            continue
+        context = build_relationship_context_for_turn(
+            speaker_pet_id=pet_id,
+            candidate_pet_ids=candidate_ids,
+            relationships=relationships,
+            record_expression=False,
+        )
+        allowed_context = [
+            item
+            for item in context
+            if item.get("role") == "primary_outgoing"
+            and int(item.get("to_pet_id")) == int(primary_speaker["id"])
+            and item.get("allow_natural_expression")
+        ]
+        if allowed_context:
+            candidate_reactors.append(pet)
+            reaction_context_by_pet_id[pet_id] = allowed_context
+
+    if not candidate_reactors:
+        return []
+
+    try:
+        messages = build_pet_group_reaction_gate_messages(
+            owner_text=owner_text,
+            primary_speaker=primary_speaker,
+            primary_reply=primary_reply,
+            candidate_reactors=candidate_reactors,
+            reaction_context_by_pet_id=reaction_context_by_pet_id,
+        )
+        response = (reaction_gate_llm_call or _call_group_chat_llm)(messages, [])
+        decision = _json_object_from_llm_text(_group_chat_text_from_llm(response)) or {}
+        reaction_items = decision.get("reactions")
+        if not isinstance(reaction_items, list):
+            if decision.get("should_react"):
+                reaction_items = [{"pet_id": decision.get("reactor_pet_id"), "should_react": True}]
+            else:
+                reaction_items = []
+        reactions: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+        for item in reaction_items:
+            if not isinstance(item, dict) or not item.get("should_react"):
+                continue
+            try:
+                reactor_id = int(item.get("pet_id"))
+            except (TypeError, ValueError):
+                continue
+            reactor = next((pet for pet in candidate_reactors if int(pet["id"]) == reactor_id), None)
+            if reactor is None:
+                continue
+            reactions.append((reactor, reaction_context_by_pet_id[reactor_id]))
+        return reactions
+    except Exception as exc:
+        log_exception("pet_group_chat_reaction_gate_failed", None, exc)
+        return []
+
+
+def handle_pet_group_chat_text(
+    chat_id: str,
+    text: str,
+    llm_call: Optional[Any] = None,
+    planner_llm_call: Optional[Any] = None,
+    reaction_gate_llm_call: Optional[Any] = None,
+) -> bool:
+    if not text.strip():
+        return False
+    try:
+        pets = api_get_pets(chat_id)
+        if not pets:
+            send_message(chat_id, "还没有宠物。", reply_markup=inline_keyboard([[("创建宠物", "pet_create:start")]]))
+            return True
+
+        ACTIVE_PET_GROUP_CHATS.add(chat_id)
+        recent_speaker_pet_ids = PET_GROUP_LAST_SPEAKER_IDS.get(chat_id, [])
+        responders = choose_pet_group_responders(
+            owner_text=text.strip(),
+            pets=pets,
+            current_pet_id=None,
+            recent_speaker_pet_ids=recent_speaker_pet_ids,
+            planner_llm_call=planner_llm_call,
+        )
+        candidate_ids = [int(pet["id"]) for pet in pets]
+        relationships_response = requests.get(f"{API_BASE_URL}/pet-relationships", timeout=10)
+        relationships_response.raise_for_status()
+        relationships = relationships_response.json()
+        memories = fetch_recent_pet_memories(limit=8)
+        sent_speaker_ids: list[int] = []
+        primary_reply = ""
+        for speaker in responders:
+            relationship_context = build_relationship_context_for_turn(
+                speaker_pet_id=int(speaker["id"]),
+                candidate_pet_ids=candidate_ids,
+                relationships=relationships,
+            )
+            messages = build_pet_group_chat_messages(
+                owner_text=text.strip(),
+                speaker=speaker,
+                pets=pets,
+                relationship_context=relationship_context,
+                pet_memory_context=build_pet_memory_context_for_prompt(
+                    memories,
+                    speaker_pet_id=int(speaker["id"]),
+                ),
+            )
+            response = (llm_call or _call_group_chat_llm)(messages, [])
+            reply = _group_chat_text_from_llm(response)
+            if not reply:
+                raise ValueError("LLM returned empty group chat reply")
+            if not primary_reply:
+                primary_reply = reply
+            sent_speaker_ids.append(int(speaker["id"]))
+            send_message(
+                chat_id,
+                f"{speaker['name']}：{reply}",
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+
+        primary_speaker = responders[0]
+        followups = choose_followup_reactors(
+            owner_text=text.strip(),
+            primary_speaker=primary_speaker,
+            primary_reply=primary_reply,
+            pets=[pet for pet in pets if int(pet["id"]) not in set(sent_speaker_ids[1:])],
+            relationships=relationships,
+            reaction_gate_llm_call=reaction_gate_llm_call,
+        )
+        for reactor, reaction_context in followups:
+            reaction_messages = build_pet_group_chat_messages(
+                owner_text=text.strip(),
+                speaker=reactor,
+                pets=pets,
+                relationship_context=reaction_context,
+                pet_memory_context=build_pet_memory_context_for_prompt(
+                    memories,
+                    speaker_pet_id=int(reactor["id"]),
+                ),
+                short_reaction=True,
+            )
+            reaction_response = (llm_call or _call_group_chat_llm)(reaction_messages, [])
+            reaction = _group_chat_text_from_llm(reaction_response)
+            if reaction:
+                for item in reaction_context:
+                    _record_relationship_expression(item, time.monotonic())
+                send_message(
+                    chat_id,
+                    f"{reactor['name']}：{reaction}",
+                    reply_markup=MAIN_REPLY_KEYBOARD,
+                )
+                sent_speaker_ids.append(int(reactor["id"]))
+        if sent_speaker_ids:
+            PET_GROUP_LAST_SPEAKER_IDS[chat_id] = sent_speaker_ids[-3:]
+        return True
+    except Exception as exc:
+        log_exception("pet_group_chat_reply_failed", None, exc, chat_id=chat_id)
+        send_message(chat_id, f"群聊回复生成失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+
+
+def find_pet(pet_id: int, chat_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    pets = api_get_pets(chat_id) if chat_id is not None else _fetch_pets()
+    return next((pet for pet in pets if int(pet["id"]) == pet_id), None)
+
+
+def ask_delete_pet(chat_id: str, pet_id: int) -> None:
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    send_message(
+        chat_id,
+        f"确定要删除「{pet['name']}」吗？\n删除后它的状态记录也会从本地演示库里移除。",
+        reply_markup=inline_keyboard(
+            [
+                [("确认删除", f"pet_delete:confirm:{pet_id}")],
+                [("取消", "pets")],
+            ]
+        ),
+    )
+
+
+def delete_pet_from_chat(chat_id: str, pet_id: int) -> None:
+    try:
+        response = requests.delete(
+            f"{API_BASE_URL}/pets/{pet_id}",
+            **owner_params_kwarg(chat_id),
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(response.text)
+        pet = response.json()
+    except (RuntimeError, requests.RequestException) as exc:
+        send_message(chat_id, f"删除失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    send_message(chat_id, f"已删除「{pet['name']}」。")
+    if CURRENT_PET_IDS.get(chat_id) == int(pet_id):
+        CURRENT_PET_IDS.pop(chat_id, None)
+    handle_pets_command(chat_id)
+
+
+def handle_desktop_companion_menu(chat_id: str) -> None:
+    pets = api_get_pets(chat_id)
+    if not pets:
+        send_message(chat_id, "还没有宠物。", reply_markup=inline_keyboard([[("创建宠物", "pet_create:start")]]))
+        return
+
+    rows = [[("全部有素材的一起上桌面", "desktop:all")]]
+    rows.extend([[(f"{pet['name']} 单独上桌面", f"desktop:{pet['id']}")] for pet in pets])
+    send_message(
+        chat_id,
+        "想让谁来桌面陪你？可以选一只，也可以让已经有桌宠素材的宠物一起出现。",
+        reply_markup=inline_keyboard(rows),
+    )
+
+
+def handle_desktop_companion(chat_id: str, pet_id: Optional[int] = None) -> None:
+    if pet_id is None:
+        handle_desktop_companion_menu(chat_id)
+        return
+    else:
+        try:
+            set_current_pet(chat_id, pet_id)
+        except (RuntimeError, requests.RequestException) as exc:
+            send_message(chat_id, f"指定互动对象失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+    result = RUNTIME_CONTROLLER.launch_desktop_companion(chat_id=chat_id, pet_id=pet_id)
     if result.ok:
         send_message(
             chat_id,
@@ -312,10 +1635,140 @@ def handle_desktop_companion(chat_id: str) -> None:
     )
 
 
-def start_avatar_flow(chat_id: str) -> None:
+def handle_all_desktop_companions(chat_id: str) -> None:
+    result = RUNTIME_CONTROLLER.launch_all_desktop_companions(chat_id=chat_id)
+    send_message(
+        chat_id,
+        f"{result.message}\n\n调试编号：{result.trace_id}",
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+
+
+def start_pet_create_flow(chat_id: str) -> None:
+    trace_id = new_trace_id("pet_create")
+    PENDING_PET_FLOWS[chat_id] = {"step": "await_name", "trace_id": trace_id}
+    log_event("pet_create_flow_started", trace_id, chat_id=chat_id)
+    send_message(
+        chat_id,
+        "先给新宠物起个名字。接下来我会继续问物种、性格描述和特征描述。",
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+
+
+def handle_pet_create_text(chat_id: str, text: str) -> bool:
+    flow = PENDING_PET_FLOWS.get(chat_id)
+    if not flow:
+        return False
+    step = flow.get("step")
+    value = text.strip()
+    if not value:
+        send_message(chat_id, "这一步需要输入一点文字。")
+        return True
+
+    if step == "await_name":
+        flow.update({"step": "await_species", "name": value})
+        send_message(
+            chat_id,
+            f"名字收到：{value}。它是什么类型的宠物？可以点猫/狗，或者直接输入自定义种类。",
+            reply_markup=inline_keyboard(
+                [[("猫", "pet_create:species:cat"), ("狗", "pet_create:species:dog"), ("其他", "pet_create:species:other")]]
+            ),
+        )
+        return True
+
+    if step == "await_species":
+        set_pet_create_species(chat_id, value)
+        return True
+
+    if step == "await_custom_species":
+        flow.update({"step": "await_personality_description", "species": "other", "custom_species": value})
+        send_message(chat_id, f"种类记下了：{value}。请描述一下它的性格，比如黏人、傲娇、安静、爱冒险。")
+        return True
+
+    if step == "await_personality_description":
+        flow.update({"step": "await_traits_description", "personality_description": value})
+        send_message(chat_id, "性格记下了。再描述一下它的外观特征、辨识点或你想保留的气质。")
+        return True
+
+    if step != "await_traits_description":
+        return False
+
+    flow["traits_description"] = value
+    trace_id = flow.get("trace_id")
+    try:
+        profile = {
+            "personality_description": flow["personality_description"],
+            "traits_description": flow["traits_description"],
+        }
+        if flow.get("custom_species"):
+            profile["custom_species"] = flow["custom_species"]
+        pet_response = requests.post(
+            f"{API_BASE_URL}/pets",
+            json={
+                "name": flow["name"],
+                **owner_params(chat_id),
+                "species": flow["species"],
+                "personality": "gentle",
+                "owner_call_name": "妈",
+                "pet_mode": "virtual",
+                "profile": profile,
+            },
+            timeout=30,
+        )
+        if pet_response.status_code >= 400:
+            raise RuntimeError(pet_response.text)
+        pet = pet_response.json()
+        CURRENT_PET_IDS[chat_id] = int(pet["id"])
+    except (RuntimeError, requests.RequestException, ValueError, KeyError) as exc:
+        log_exception("pet_create_flow_failed", trace_id, exc, chat_id=chat_id)
+        send_message(chat_id, f"创建宠物失败。\n调试编号：{trace_id}\n错误：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+
+    PENDING_PET_FLOWS.pop(chat_id, None)
+    log_event("pet_create_flow_succeeded", trace_id, chat_id=chat_id, pet_id=pet.get("id"))
+    send_message(
+        chat_id,
+        f"{pet['name']} 的基础资料建好了。下一步继续把它做成独一无二的桌宠形象。",
+        reply_markup=inline_keyboard(
+            [
+                [("定制形象", f"set:avatar:{pet['id']}")],
+                [("设置宠物关系", "rel:start")],
+                [("返回主菜单", "menu")],
+            ]
+        ),
+    )
+    return True
+
+
+def set_pet_create_species(chat_id: str, species: str) -> None:
+    flow = PENDING_PET_FLOWS.get(chat_id)
+    if not flow or flow.get("step") != "await_species":
+        send_message(chat_id, "当前没有等待选择物种的新宠物流程。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    normalized = species.strip().lower()
+    if normalized == "other":
+        flow.update({"step": "await_custom_species"})
+        send_message(chat_id, "它具体是什么种类？可以直接输入，比如章鱼、龙猫、狐狸、史莱姆。")
+        return
+    if normalized in PET_SPECIES_LABELS:
+        flow.update({"step": "await_personality_description", "species": normalized})
+        send_message(
+            chat_id,
+            f"种类收到：{PET_SPECIES_LABELS[normalized]}。请描述一下它的性格，比如黏人、傲娇、安静、爱冒险。",
+        )
+        return
+    flow.update({"step": "await_personality_description", "species": "other", "custom_species": species.strip()})
+    send_message(chat_id, f"种类记下了：{species.strip()}。请描述一下它的性格，比如黏人、傲娇、安静、爱冒险。")
+
+
+def start_avatar_flow(chat_id: str, pet_id: Optional[int] = None) -> None:
+    current_flow = PENDING_AVATAR_FLOWS.get(chat_id)
+    if _avatar_flow_is_generating(current_flow):
+        send_message(chat_id, format_avatar_busy_text(current_flow or {}), reply_markup=MAIN_REPLY_KEYBOARD)
+        return
     trace_id = new_trace_id("avatar")
-    PENDING_AVATAR_FLOWS[chat_id] = {"step": "await_photo", "trace_id": trace_id}
-    log_event("avatar_flow_started", trace_id, chat_id=chat_id)
+    PENDING_AVATAR_FLOWS[chat_id] = {"step": "await_photo", "trace_id": trace_id, "pet_id": pet_id}
+    log_event("avatar_flow_started", trace_id, chat_id=chat_id, pet_id=pet_id)
     send_message(
         chat_id,
         f"把参考图发给我。收到后我会再问你想要的宠物形象风格；先只生成预览，等你确认后才会生成桌宠素材包。\n\n调试编号：{trace_id}",
@@ -354,6 +1807,42 @@ def _download_telegram_file(file_id: str) -> tuple[bytes, str, str]:
 
 def _absolute_api_url(path: str) -> str:
     return f"{API_BASE_URL.rstrip('/')}{path}"
+
+
+def _message_has_image(message: dict[str, Any]) -> bool:
+    if message.get("photo"):
+        return True
+    document = message.get("document") or {}
+    return str(document.get("mime_type", "")).startswith("image/")
+
+
+def _avatar_default_style_from_pet(flow: dict[str, Any], chat_id: Optional[str] = None) -> str:
+    pet_id = flow.get("pet_id")
+    parts = ["根据参考图生成一个适合桌面陪伴的完整宠物形象。"]
+    if pet_id is None:
+        parts.append("保持参考图的主要气质、颜色和可爱特征。")
+        return "\n".join(parts)
+    try:
+        pets = api_get_pets(chat_id) if chat_id is not None else _fetch_pets()
+        pet = next((item for item in pets if int(item["id"]) == int(pet_id)), None)
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pet = None
+    if not pet:
+        parts.append("保持参考图的主要气质、颜色和可爱特征。")
+        return "\n".join(parts)
+
+    profile = {}
+    try:
+        profile = json.loads(pet.get("profile_json") or "{}")
+    except (TypeError, ValueError):
+        profile = {}
+    species = profile.get("custom_species") or pet.get("species") or "宠物"
+    parts.append(f"宠物种类：{species}")
+    if profile.get("personality_description"):
+        parts.append(f"性格：{profile['personality_description']}")
+    if profile.get("traits_description"):
+        parts.append(f"外观特征：{profile['traits_description']}")
+    return "\n".join(parts)
 
 
 def handle_avatar_photo(chat_id: str, message: dict[str, Any]) -> bool:
@@ -397,56 +1886,266 @@ def handle_avatar_photo(chat_id: str, message: dict[str, Any]) -> bool:
             "extension": extension,
         }
     )
+    caption = (message.get("caption") or "").strip()
+    style_text = caption or _avatar_default_style_from_pet(flow, chat_id=chat_id)
+    send_message(chat_id, "收到参考图了，我先开始生成预览。生成后你还可以继续发文字微调。")
+    start_avatar_preview_generation(chat_id, style_text)
+    return True
+
+
+def _photo_file_id_from_message(message: dict[str, Any]) -> str:
+    photos = message.get("photo") or []
+    if photos:
+        return str(photos[-1].get("file_id", ""))
+    document = message.get("document") or {}
+    if str(document.get("mime_type", "")).startswith("image/"):
+        return str(document.get("file_id", ""))
+    return ""
+
+
+def _looks_like_co_experienced_memory(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    shared_signals = [
+        "一起",
+        "我们",
+        "陪我",
+        "陪着我",
+        "陪你们",
+        "带着",
+        "和你们",
+        "跟你们",
+        "和你",
+        "跟你",
+        "共同",
+        "一块",
+    ]
+    moment_signals = [
+        "拍",
+        "照片",
+        "去了",
+        "去",
+        "看",
+        "玩",
+        "守夜",
+        "散步",
+        "旅行",
+        "海边",
+        "晚霞",
+        "今天",
+        "昨晚",
+        "刚才",
+    ]
+    return any(signal in normalized for signal in shared_signals) and any(
+        signal in normalized for signal in moment_signals
+    )
+
+
+def _memory_title_from_text(text: str) -> str:
+    title = text.strip().replace("\n", " ")
+    return title[:18] if title else "共同经历"
+
+
+def _list_pets_for_memory(chat_id: str) -> list[dict[str, Any]]:
+    return api_get_pets(chat_id)
+
+
+def _create_photo_memory_from_text(chat_id: str, text: str, flow: dict[str, Any]) -> dict[str, Any]:
+    pets = _list_pets_for_memory(chat_id)
+    if not pets:
+        raise RuntimeError("还没有宠物，不能写入共同记忆。")
+    participant_pet_ids = [int(pet["id"]) for pet in pets]
+    response = requests.post(
+        f"{API_BASE_URL}/pet-memories",
+        json={
+            "memory_type": "co_experienced",
+            "title": _memory_title_from_text(text),
+            "content": text.strip(),
+            "source": "telegram",
+            "emotional_tone": "warm",
+            "importance": 4,
+            "visibility": "home",
+            "participant_pet_ids": participant_pet_ids,
+            "metadata": {
+                "telegram_chat_id": chat_id,
+                "telegram_photo_file_id": flow.get("photo_file_id"),
+                "telegram_photo_message_id": flow.get("message_id"),
+                "telegram_photo_caption": flow.get("caption", ""),
+            },
+        },
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    return response.json()
+
+
+def handle_memory_photo(chat_id: str, message: dict[str, Any]) -> bool:
+    if not _message_has_image(message):
+        return False
+    file_id = _photo_file_id_from_message(message)
+    if not file_id:
+        send_message(chat_id, "我看到像是图片，但没有拿到可用的文件编号。")
+        return True
+    PENDING_MEMORY_PHOTO_FLOWS[chat_id] = {
+        "photo_file_id": file_id,
+        "message_id": message.get("message_id"),
+        "caption": (message.get("caption") or "").strip(),
+    }
     send_message(
         chat_id,
-        "收到参考图了。选一个方向，或直接发文字描述你想要的桌宠形象。",
-        reply_markup=inline_keyboard(
-            [
-                [("章鱼宠物", "avatar_style:octopus"), ("猫猫宠物", "avatar_style:cat")],
-                [("狐狸宠物", "avatar_style:fox"), ("自己描述", "avatar_style:custom")],
-            ]
-        ),
+        "我看到这张照片啦。这是我们一起经历的吗？你给我讲讲当时发生了什么，我会判断要不要把它记成共同记忆。",
+        reply_markup=MAIN_REPLY_KEYBOARD,
     )
     return True
 
 
-def handle_avatar_style_text(chat_id: str, text: str) -> bool:
-    flow = PENDING_AVATAR_FLOWS.get(chat_id)
-    if not flow or flow.get("step") != "await_style":
+def handle_memory_photo_text(chat_id: str, text: str) -> bool:
+    flow = PENDING_MEMORY_PHOTO_FLOWS.get(chat_id)
+    if not flow:
         return False
-    if not text.strip():
-        send_message(chat_id, "请描述一下想要的形象风格。")
+    content = text.strip()
+    if not content:
+        return False
+    if not _looks_like_co_experienced_memory(content):
+        PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+        send_message(
+            chat_id,
+            "这段更像普通说明，我先不写成共同记忆。以后你可以说“我们一起……”再讲发生了什么。",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
         return True
-
-    flow["step"] = "generating_preview"
-    trace_id = flow.get("trace_id")
-    log_event(
-        "avatar_preview_generation_started",
-        trace_id,
-        chat_id=chat_id,
-        content_type=flow.get("content_type"),
-        extension=flow.get("extension"),
-        style_length=len(text.strip()),
-    )
-    started_at = time.monotonic()
+    try:
+        memory = _create_photo_memory_from_text(chat_id, content, flow)
+    except (RuntimeError, requests.RequestException) as exc:
+        log_exception("pet_memory_photo_create_failed", None, exc, chat_id=chat_id)
+        send_message(chat_id, f"共同记忆保存失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
     send_message(
         chat_id,
-        "开始生成形象预览。通常需要 30-90 秒；这一步只生成预览，不会生成桌宠素材包。\n\n"
-        f"当前阶段：生成预览\n调试编号：{trace_id}",
+        f"记住了。这张照片已经成为我们的共同记忆了。记忆编号：{memory.get('id')}",
+        reply_markup=MAIN_REPLY_KEYBOARD,
     )
-    send_chat_action(chat_id, "upload_photo")
+    return True
+
+
+def _content_type_for_extension(extension: str) -> str:
+    normalized = extension.lower()
+    if normalized in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if normalized == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def _avatar_generation_source(flow: dict[str, Any], prefer_preview: bool) -> tuple[bytes, str, str]:
+    if prefer_preview:
+        preview_url = (flow.get("preview") or {}).get("image_url", "")
+        preview_path = _local_static_path(preview_url)
+        if preview_path is not None:
+            extension = preview_path.suffix or ".png"
+            return preview_path.read_bytes(), _content_type_for_extension(extension), extension
+    return (
+        flow["image_bytes"],
+        flow.get("content_type", "image/jpeg"),
+        flow.get("extension", ".jpg"),
+    )
+
+
+def _avatar_style_instruction(flow: dict[str, Any], text: str, revision: bool) -> str:
+    base = text.strip()
+    if revision:
+        previous_style = str(flow.get("style") or "").strip()
+        if previous_style:
+            base = f"{previous_style}\n\n用户对当前预览的修改要求：{base}"
+        else:
+            base = f"用户对当前预览的修改要求：{base}"
+    return f"{base}\n\n{AVATAR_STYLE_LOCK_RULE}"
+
+
+def _finish_avatar_preview_generation(
+    chat_id: str,
+    trace_id: object,
+    style_text: str,
+    preview: dict[str, Any],
+    started_at: float,
+    progress_message_id: Optional[int],
+    revision: bool,
+) -> None:
+    flow = PENDING_AVATAR_FLOWS.get(chat_id)
+    if not flow or flow.get("trace_id") != trace_id:
+        return
+
+    flow.update({"step": "await_confirm", "preview": preview, "style": style_text.strip()})
+    elapsed = round(time.monotonic() - started_at, 1)
+    log_event(
+        "avatar_preview_generation_succeeded",
+        trace_id,
+        chat_id=chat_id,
+        image_url=preview.get("image_url"),
+        style_mode=preview.get("style_mode"),
+        elapsed_seconds=elapsed,
+        revision=revision,
+    )
+    complete_text = f"{_progress_bar(5, 5)} 5/5\n预览生成好了，用时 {elapsed} 秒。现在发给你确认。\n\n调试编号：{trace_id}"
+    if progress_message_id is not None:
+        try:
+            edit_message_text(chat_id, progress_message_id, complete_text)
+        except RuntimeError:
+            send_message(chat_id, complete_text)
+    else:
+        send_message(chat_id, complete_text)
+    caption = "这是更新后的形象预览。还可以继续发文字让我微调，满意后再确认生成桌宠素材。"
+    if not revision:
+        caption = "这是形象预览。确认后会绑定到这只宠物身上，再正式开始陪伴的旅程哦！"
+    send_local_photo(
+        chat_id,
+        preview["image_url"],
+        caption,
+        reply_markup=inline_keyboard(
+            [
+                [("确认并生成桌宠素材", "avatar:confirm")],
+                [("重新开始", "avatar:restart"), ("取消", "avatar:cancel")],
+            ]
+        ),
+    )
+
+
+def _run_avatar_preview_generation(
+    chat_id: str,
+    trace_id: object,
+    style_text: str,
+    source_bytes: bytes,
+    content_type: str,
+    extension: str,
+    progress_message_id: Optional[int],
+    progress_stop: threading.Event,
+    started_at: float,
+    revision: bool,
+) -> None:
+    slot_released = False
+
+    def release_slot_once() -> None:
+        nonlocal slot_released
+        if slot_released:
+            return
+        _release_avatar_generation_slot(chat_id, trace_id)
+        slot_released = True
+
     try:
         response = requests.post(
             f"{API_BASE_URL}/image-style",
             files={
                 "image": (
-                    f"telegram-reference{flow.get('extension', '.jpg')}",
-                    flow["image_bytes"],
-                    flow["content_type"],
+                    f"telegram-reference{extension}",
+                    source_bytes,
+                    content_type,
                 )
             },
             data={
-                "style": text.strip(),
+                "style": style_text,
                 "style_mode": "animal_pixel_2d",
             },
             timeout=180,
@@ -458,6 +2157,7 @@ def handle_avatar_style_text(chat_id: str, text: str) -> bool:
             chat_id=chat_id,
             status_code=response.status_code,
             elapsed_seconds=elapsed,
+            revision=revision,
         )
         if response.status_code >= 400:
             log_event(
@@ -466,45 +2166,495 @@ def handle_avatar_style_text(chat_id: str, text: str) -> bool:
                 chat_id=chat_id,
                 status_code=response.status_code,
                 response_text=response.text[:1000],
+                revision=revision,
             )
             raise RuntimeError(response.text)
         preview = response.json()
     except (RuntimeError, requests.RequestException) as exc:
-        PENDING_AVATAR_FLOWS.pop(chat_id, None)
-        log_exception("avatar_preview_generation_failed", trace_id, exc, chat_id=chat_id)
+        flow = PENDING_AVATAR_FLOWS.get(chat_id)
+        if flow and flow.get("trace_id") == trace_id:
+            if revision and flow.get("preview"):
+                flow["step"] = "await_confirm"
+            else:
+                PENDING_AVATAR_FLOWS.pop(chat_id, None)
+        log_exception("avatar_preview_generation_failed", trace_id, exc, chat_id=chat_id, revision=revision)
+        failure_text = format_avatar_failure_text(trace_id, exc)
+        if progress_message_id is not None:
+            try:
+                edit_message_text(chat_id, progress_message_id, failure_text)
+            except RuntimeError:
+                send_message(chat_id, failure_text, reply_markup=MAIN_REPLY_KEYBOARD)
+            else:
+                send_message(
+                    chat_id,
+                    f"这次形象预览生成失败了。\n调试编号：{trace_id}",
+                    reply_markup=MAIN_REPLY_KEYBOARD,
+                )
+        else:
+            send_message(chat_id, failure_text, reply_markup=MAIN_REPLY_KEYBOARD)
+        progress_stop.set()
+        release_slot_once()
+        return
+
+    progress_stop.set()
+    try:
+        _finish_avatar_preview_generation(
+            chat_id=chat_id,
+            trace_id=trace_id,
+            style_text=style_text,
+            preview=preview,
+            started_at=started_at,
+            progress_message_id=progress_message_id,
+            revision=revision,
+        )
+    finally:
+        release_slot_once()
+
+
+def start_avatar_preview_generation(chat_id: str, text: str, revision: bool = False) -> None:
+    flow = PENDING_AVATAR_FLOWS.get(chat_id)
+    if not flow:
+        return
+    if _avatar_flow_is_generating(flow):
+        send_message(chat_id, format_avatar_busy_text(flow), reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    source_bytes, content_type, extension = _avatar_generation_source(flow, prefer_preview=revision)
+    trace_id = flow.get("trace_id")
+    if not _acquire_avatar_generation_slot(chat_id, trace_id):
         send_message(
             chat_id,
-            f"生成预览失败。\n阶段：生成形象预览\n调试编号：{trace_id}\n错误：{exc}",
+            "现在已经有形象生成任务在运行，我先不重复提交，避免机器人卡住。\n"
+            "请等当前进度消息结束后再试；其他底部按钮可以继续使用。\n\n"
+            f"调试编号：{trace_id}",
             reply_markup=MAIN_REPLY_KEYBOARD,
         )
-        return True
+        return
 
-    flow.update({"step": "await_confirm", "preview": preview, "style": text.strip()})
-    elapsed = round(time.monotonic() - started_at, 1)
+    started_at = time.monotonic()
+    flow.update(
+        {
+            "step": "revising_preview" if revision else "generating_preview",
+            "started_at": started_at,
+        }
+    )
+    style_text = _avatar_style_instruction(flow, text, revision)
     log_event(
-        "avatar_preview_generation_succeeded",
+        "avatar_preview_generation_started",
         trace_id,
         chat_id=chat_id,
-        image_url=preview.get("image_url"),
-        style_mode=preview.get("style_mode"),
-        elapsed_seconds=elapsed,
+        content_type=content_type,
+        extension=extension,
+        style_length=len(style_text.strip()),
+        revision=revision,
     )
-    send_message(
+    progress_response = send_message(
         chat_id,
-        f"预览生成好了，用时 {elapsed} 秒。现在发给你确认。",
-    )
-    send_local_photo(
-        chat_id,
-        preview["image_url"],
-        "这是形象预览。确认后我才会生成桌宠素材包并设为当前宠物。",
-        reply_markup=inline_keyboard(
-            [
-                [("确认并生成桌宠素材", "avatar:confirm")],
-                [("重新开始", "avatar:restart"), ("取消", "avatar:cancel")],
-            ]
+        format_avatar_progress_text(
+            AVATAR_PREVIEW_PROGRESS_STAGES[0],
+            trace_id,
+            1,
+            len(AVATAR_PREVIEW_PROGRESS_STAGES),
         ),
     )
+    progress_message_id = _telegram_message_id(progress_response)
+    flow["progress_message_id"] = progress_message_id
+    progress_stop = start_avatar_progress_updater(chat_id, progress_message_id, trace_id)
+    send_chat_action(chat_id, "upload_photo")
+    threading.Thread(
+        target=_run_avatar_preview_generation,
+        args=(
+            chat_id,
+            trace_id,
+            style_text,
+            source_bytes,
+            content_type,
+            extension,
+            progress_message_id,
+            progress_stop,
+            started_at,
+            revision,
+        ),
+        daemon=True,
+    ).start()
+
+
+def handle_avatar_style_text(chat_id: str, text: str) -> bool:
+    flow = PENDING_AVATAR_FLOWS.get(chat_id)
+    if not flow:
+        return False
+    step = flow.get("step")
+    if step in {"generating_preview", "revising_preview"}:
+        send_message(chat_id, format_avatar_busy_text(flow), reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    if step == "await_confirm":
+        if not text.strip():
+            send_message(chat_id, "可以直接发一句修改要求，比如：去掉绳子、毛更卷一点、眼睛更亮。")
+            return True
+        start_avatar_preview_generation(chat_id, text.strip(), revision=True)
+        return True
+    if step != "await_style":
+        return False
+    if not text.strip():
+        send_message(chat_id, "请描述一下想要的形象风格。")
+        return True
+    start_avatar_preview_generation(chat_id, text.strip())
     return True
+
+
+def _pet_id_for_avatar_flow(flow: dict[str, Any]) -> int:
+    return int(flow["pet_id"]) if flow.get("pet_id") is not None else get_default_pet_id()
+
+
+def _profile_for_pet_id(pet_id: int, chat_id: Optional[str] = None) -> dict[str, Any]:
+    pets = api_get_pets(chat_id) if chat_id is not None else _fetch_pets()
+    pet = next(
+        (item for item in pets if int(item["id"]) == pet_id),
+        None,
+    )
+    if pet and pet.get("profile_json"):
+        return json.loads(pet["profile_json"] or "{}")
+    return {}
+
+
+def _profile_with_character(
+    pet_id: int,
+    character: dict[str, Any],
+    desktop_assets_status: str,
+    chat_id: Optional[str] = None,
+) -> dict[str, Any]:
+    profile = _profile_for_pet_id(pet_id, chat_id=chat_id)
+    profile.update(
+        {
+            "avatar_image_url": character["image_url"],
+            "walking_reference_image_url": character.get("walking_reference_image_url"),
+            "character_id": character["id"],
+            "desktop_pet_manifest_url": character.get("desktop_pet_manifest_url"),
+            "desktop_pet_asset_dir": character.get("desktop_pet_asset_dir"),
+            "desktop_pet_avatar_url": character.get("desktop_pet_avatar_url"),
+            "desktop_pet_assets_status": desktop_assets_status,
+        }
+    )
+    return profile
+
+
+def update_pet_profile(chat_id: str, trace_id: object, pet_id: int, profile: dict[str, Any]) -> None:
+    update_response = requests.patch(
+        f"{API_BASE_URL}/pets/{pet_id}",
+        **owner_params_kwarg(chat_id),
+        json={"profile": profile},
+        timeout=30,
+    )
+    if update_response.status_code >= 400:
+        log_event(
+            "avatar_pet_bind_failed",
+            trace_id,
+            chat_id=chat_id,
+            status_code=update_response.status_code,
+            response_text=update_response.text[:1000],
+        )
+        raise RuntimeError(update_response.text)
+
+
+def bind_character_to_pet(
+    chat_id: str,
+    trace_id: object,
+    pet_id: int,
+    character: dict[str, Any],
+    desktop_assets_status: str,
+) -> None:
+    profile = _profile_with_character(pet_id, character, desktop_assets_status, chat_id=chat_id)
+    update_pet_profile(chat_id, trace_id, pet_id, profile)
+
+
+def mark_pet_desktop_assets_status(
+    chat_id: str,
+    trace_id: object,
+    pet_id: int,
+    desktop_assets_status: str,
+) -> None:
+    profile = _profile_for_pet_id(pet_id, chat_id=chat_id)
+    profile["desktop_pet_assets_status"] = desktop_assets_status
+    update_pet_profile(chat_id, trace_id, pet_id, profile)
+
+
+def _sticker_pack_urls(stickers: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(item.get("image_url") or "").strip()
+        for item in stickers
+        if str(item.get("image_url") or "").strip()
+    ]
+
+
+def generate_sticker_pack_in_background(
+    chat_id: str,
+    trace_id: object,
+    pet_id: int,
+    character_id: str,
+    started_at: float,
+) -> None:
+    try:
+        log_event(
+            "sticker_pack_background_started",
+            trace_id,
+            chat_id=chat_id,
+            pet_id=pet_id,
+            character_id=character_id,
+        )
+        response = requests.post(
+            f"{API_BASE_URL}/characters/{character_id}/sticker-pack",
+            json={"theme": "日常聊天表情包"},
+            timeout=900,
+        )
+        if response.status_code >= 400:
+            log_event(
+                "sticker_pack_create_failed",
+                trace_id,
+                chat_id=chat_id,
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+            raise RuntimeError(response.text)
+        pack = response.json()
+        stickers = pack.get("stickers") or []
+        sticker_urls = _sticker_pack_urls(stickers)
+        if len(sticker_urls) != STICKER_PACK_SIZE:
+            raise RuntimeError(f"表情包数量不对：期望 {STICKER_PACK_SIZE} 张，实际 {len(sticker_urls)} 张")
+
+        profile = _profile_for_pet_id(pet_id, chat_id=chat_id)
+        profile["sticker_pack_status"] = "ready"
+        profile["sticker_pack_character_id"] = character_id
+        profile["sticker_pack_urls"] = sticker_urls
+        profile["sticker_pack_theme"] = pack.get("theme") or "日常聊天表情包"
+        update_pet_profile(chat_id, trace_id, pet_id, profile)
+        log_event(
+            "sticker_pack_created",
+            trace_id,
+            chat_id=chat_id,
+            pet_id=pet_id,
+            character_id=character_id,
+            elapsed_seconds=round(time.monotonic() - started_at, 1),
+        )
+        send_message(
+            chat_id,
+            f"表情包生成好了，共 {len(sticker_urls)} 张。我先发给你预览。",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        for index, sticker in enumerate(stickers, start=1):
+            image_url = str(sticker.get("image_url") or "")
+            if image_url:
+                send_local_photo(chat_id, image_url, f"表情包 {index}/{len(sticker_urls)}")
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        log_exception("sticker_pack_background_failed", trace_id, exc, chat_id=chat_id, character_id=character_id)
+        try:
+            profile = _profile_for_pet_id(pet_id, chat_id=chat_id)
+            profile["sticker_pack_status"] = "failed"
+            update_pet_profile(chat_id, trace_id, pet_id, profile)
+        except (RuntimeError, requests.RequestException, ValueError) as status_exc:
+            log_exception(
+                "sticker_pack_status_update_failed",
+                trace_id,
+                status_exc,
+                chat_id=chat_id,
+                pet_id=pet_id,
+            )
+        send_message(
+            chat_id,
+            f"表情包生成失败。\n调试编号：{trace_id}\n错误：{exc}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+
+
+def start_sticker_pack_generation(chat_id: str, pet_id: int) -> None:
+    trace_id = new_trace_id("stickers")
+    try:
+        pet = find_pet(pet_id, chat_id=chat_id)
+        if pet is None:
+            send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+        profile = pet_profile(pet)
+        character_id = str(profile.get("character_id") or "").strip()
+        if not character_id:
+            send_message(chat_id, "这只宠物还没有确认过形象，先生成并确认形象后才能做表情包。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+        status = str(profile.get("sticker_pack_status") or "")
+        if status == "generating":
+            send_message(chat_id, "这只宠物的表情包正在生成中，我不会重复提交。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+        if status == "ready":
+            send_message(chat_id, "这只宠物已经生成过表情包了。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+
+        profile["sticker_pack_status"] = "generating"
+        profile["sticker_pack_character_id"] = character_id
+        update_pet_profile(chat_id, trace_id, pet_id, profile)
+        started_at = time.monotonic()
+        send_message(
+            chat_id,
+            f"收到，我开始给 {pet['name']} 生成 {STICKER_PACK_SIZE} 张表情包。这个会比较慢，完成后我会直接发回来。\n\n调试编号：{trace_id}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        threading.Thread(
+            target=generate_sticker_pack_in_background,
+            args=(chat_id, trace_id, pet_id, character_id, started_at),
+            daemon=True,
+        ).start()
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        log_exception("sticker_pack_start_failed", trace_id, exc, chat_id=chat_id, pet_id=pet_id)
+        send_message(chat_id, f"表情包生成启动失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+
+
+def update_pet_profile_note(
+    pet_id: int,
+    note_type: str,
+    text: str,
+    chat_id: Optional[str] = None,
+) -> dict[str, Any]:
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        raise RuntimeError(f"找不到宠物：{pet_id}")
+    profile = pet_profile(pet)
+    value = text.strip()
+    if not value:
+        raise RuntimeError("补充内容不能为空")
+    payload: dict[str, Any] = {"profile": profile}
+    if note_type == "personality_behavior":
+        notes = profile.get("personality_behavior_notes") or []
+        if isinstance(notes, str):
+            notes = [notes]
+        notes = [str(note).strip() for note in notes if str(note).strip()]
+        notes.append(value)
+        profile["personality_behavior_notes"] = notes
+    elif note_type == "speaking_style":
+        profile["speaking_style_prompt"] = value
+    elif note_type == "species":
+        profile["custom_species"] = value
+        payload["species"] = "other"
+    else:
+        raise RuntimeError(f"不支持的资料类型：{note_type}")
+    response = requests.patch(
+        f"{API_BASE_URL}/pets/{pet_id}",
+        **owner_params_kwarg(chat_id),
+        json=payload,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    return response.json()
+
+
+def start_profile_note_flow(chat_id: str, pet_id: int, note_type: str) -> None:
+    pet = find_pet(pet_id, chat_id=chat_id)
+    if pet is None:
+        send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    PENDING_SET_FIELDS[chat_id] = {
+        "kind": "profile_note",
+        "note_type": note_type,
+        "pet_id": int(pet_id),
+    }
+    if note_type == "species":
+        prompt = f"直接输入 {pet['name']} 的种类，比如：猫、狗、狐狸、龙猫、史莱姆。"
+    elif note_type == "speaking_style":
+        prompt = f"直接描述 {pet['name']} 的说话语气，比如：短句、傲娇、嘴硬但会认真回答。"
+    else:
+        prompt = f"直接发一句话补充 {pet['name']} 的性格、习惯或行为，比如：陌生人靠近会先躲起来。"
+    send_message(
+        chat_id,
+        prompt,
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+
+
+def generate_avatar_assets_in_background(
+    chat_id: str,
+    trace_id: object,
+    pet_id: int,
+    character_id: str,
+    started_at: float,
+) -> None:
+    completed_animation_labels: list[str] = []
+    try:
+        log_event(
+            "avatar_assets_background_started",
+            trace_id,
+            chat_id=chat_id,
+            pet_id=pet_id,
+            character_id=character_id,
+        )
+        character = None
+        total = len(BASIC_DESKTOP_ANIMATION_NAMES)
+        for index, animation_name in enumerate(BASIC_DESKTOP_ANIMATION_NAMES, start=1):
+            assets_response = requests.post(
+                f"{API_BASE_URL}/characters/{character_id}/desktop-assets",
+                params={"animations": animation_name},
+                timeout=AVATAR_ASSET_GENERATION_TIMEOUT_SECONDS,
+            )
+            if assets_response.status_code >= 400:
+                log_event(
+                    "avatar_assets_create_failed",
+                    trace_id,
+                    chat_id=chat_id,
+                    status_code=assets_response.status_code,
+                    response_text=assets_response.text[:1000],
+                    animation_name=animation_name,
+                )
+                raise RuntimeError(assets_response.text)
+            character = assets_response.json()
+            bind_character_to_pet(chat_id, trace_id, pet_id, character, "generating")
+            label = AVATAR_ASSET_ANIMATION_LABELS.get(animation_name, animation_name)
+            completed_animation_labels.append(label)
+            log_event(
+                "avatar_asset_animation_created",
+                trace_id,
+                chat_id=chat_id,
+                character_id=character.get("id"),
+                animation_name=animation_name,
+                animation_index=index,
+                animation_total=total,
+                manifest=character.get("desktop_pet_manifest_url"),
+                elapsed_seconds=round(time.monotonic() - started_at, 1),
+            )
+            send_message(
+                chat_id,
+                f"桌宠动作已生成：{label}（{index}/{total}）。已生成的动作已经可以先用。",
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+        if character is None:
+            raise RuntimeError("没有生成任何桌宠动作素材。")
+        bind_character_to_pet(chat_id, trace_id, pet_id, character, "ready")
+        log_event(
+            "avatar_assets_created",
+            trace_id,
+            chat_id=chat_id,
+            character_id=character.get("id"),
+            manifest=character.get("desktop_pet_manifest_url"),
+            elapsed_seconds=round(time.monotonic() - started_at, 1),
+        )
+        send_message(
+            chat_id,
+            "桌宠动画素材包已经生成完成，后续桌面陪伴会使用新的动作素材。",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        log_exception("avatar_assets_background_failed", trace_id, exc, chat_id=chat_id, character_id=character_id)
+        try:
+            mark_pet_desktop_assets_status(chat_id, trace_id, pet_id, "failed")
+        except (RuntimeError, requests.RequestException, ValueError) as status_exc:
+            log_exception(
+                "avatar_assets_status_update_failed",
+                trace_id,
+                status_exc,
+                chat_id=chat_id,
+                pet_id=pet_id,
+            )
+        send_message(
+            chat_id,
+            "基础形象已经可用，但桌宠动画素材后台生成没有全部完成。\n"
+            f"已完成动作：{('、'.join(completed_animation_labels) if completed_animation_labels else '暂无')}\n"
+            f"调试编号：{trace_id}\n错误：{exc}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
 
 
 def confirm_avatar_flow(chat_id: str) -> None:
@@ -519,7 +2669,7 @@ def confirm_avatar_flow(chat_id: str) -> None:
     started_at = time.monotonic()
     send_message(
         chat_id,
-        "收到确认。现在开始生成桌宠素材包并绑定到当前宠物。\n\n"
+        "收到确认。现在先绑定基础形象；桌宠动画素材会在后台继续生成。\n\n"
         f"当前阶段：确认角色\n调试编号：{trace_id}",
     )
     send_chat_action(chat_id, "typing")
@@ -531,7 +2681,7 @@ def confirm_avatar_flow(chat_id: str) -> None:
                 "style_mode": preview["style_mode"],
                 "description": flow.get("style", "Telegram custom avatar"),
             },
-            timeout=30,
+            timeout=120,
         )
         if character_response.status_code >= 400:
             log_event(
@@ -550,77 +2700,21 @@ def confirm_avatar_flow(chat_id: str) -> None:
             character_id=character.get("id"),
             elapsed_seconds=round(time.monotonic() - started_at, 1),
         )
-        send_message(
-            chat_id,
-            "角色已确认。继续生成 idle / walk / sleep / happy / work 等桌宠动画素材。",
-        )
-        send_chat_action(chat_id, "typing")
-
-        assets_response = requests.post(
-            f"{API_BASE_URL}/characters/{character['id']}/desktop-assets",
-            timeout=120,
-        )
-        if assets_response.status_code >= 400:
-            log_event(
-                "avatar_assets_create_failed",
-                trace_id,
-                chat_id=chat_id,
-                status_code=assets_response.status_code,
-                response_text=assets_response.text[:1000],
+        pet_id = _pet_id_for_avatar_flow(flow)
+        bind_character_to_pet(chat_id, trace_id, pet_id, character, "generating")
+        walking_reference_image_url = str(character.get("walking_reference_image_url") or "").strip()
+        if walking_reference_image_url:
+            send_local_photo(
+                chat_id,
+                walking_reference_image_url,
+                "这是站立行走参考图。后续行走 GIF 会用这张图作为 Wan 的首帧参考。",
+                reply_markup=MAIN_REPLY_KEYBOARD,
             )
-            raise RuntimeError(assets_response.text)
-        character = assets_response.json()
-        log_event(
-            "avatar_assets_created",
-            trace_id,
-            chat_id=chat_id,
-            character_id=character.get("id"),
-            manifest=character.get("desktop_pet_manifest_url"),
-            elapsed_seconds=round(time.monotonic() - started_at, 1),
-        )
-        send_message(chat_id, "桌宠素材包已生成。最后一步：绑定到当前宠物。")
-        send_chat_action(chat_id, "typing")
-
-        pet_id = get_default_pet_id()
-        pets_response = requests.get(f"{API_BASE_URL}/pets", timeout=10)
-        pets_response.raise_for_status()
-        pet = next(
-            (item for item in pets_response.json() if int(item["id"]) == pet_id),
-            None,
-        )
-        profile = {}
-        if pet and pet.get("profile_json"):
-            import json
-
-            profile = json.loads(pet["profile_json"] or "{}")
-        profile.update(
-            {
-                "avatar_image_url": character["image_url"],
-                "character_id": character["id"],
-                "desktop_pet_manifest_url": character.get("desktop_pet_manifest_url"),
-                "desktop_pet_asset_dir": character.get("desktop_pet_asset_dir"),
-                "desktop_pet_avatar_url": character.get("desktop_pet_avatar_url"),
-            }
-        )
-        update_response = requests.patch(
-            f"{API_BASE_URL}/pets/{pet_id}",
-            json={"profile": profile},
-            timeout=30,
-        )
-        if update_response.status_code >= 400:
-            log_event(
-                "avatar_pet_bind_failed",
-                trace_id,
-                chat_id=chat_id,
-                status_code=update_response.status_code,
-                response_text=update_response.text[:1000],
-            )
-            raise RuntimeError(update_response.text)
     except (RuntimeError, requests.RequestException, ValueError) as exc:
         log_exception("avatar_confirm_failed", trace_id, exc, chat_id=chat_id)
         send_message(
             chat_id,
-            f"确认失败。\n阶段：生成素材并绑定宠物\n调试编号：{trace_id}\n错误：{exc}",
+            f"确认失败。\n阶段：确认并绑定基础形象\n调试编号：{trace_id}\n错误：{exc}",
             reply_markup=MAIN_REPLY_KEYBOARD,
         )
         return
@@ -631,20 +2725,25 @@ def confirm_avatar_flow(chat_id: str) -> None:
         trace_id,
         chat_id=chat_id,
         character_id=character.get("id"),
-        manifest=character.get("desktop_pet_manifest_url"),
         elapsed_seconds=round(time.monotonic() - started_at, 1),
     )
     send_message(
         chat_id,
-        f"确认好了。我已经生成桌宠素材包，并设为当前宠物形象。\n\n调试编号：{trace_id}",
+        f"确认好了。基础形象已经绑定到这只宠物，动画素材正在后台生成；你可以继续使用其他功能。\n\n调试编号：{trace_id}",
         reply_markup=MAIN_REPLY_KEYBOARD,
     )
+    threading.Thread(
+        target=generate_avatar_assets_in_background,
+        args=(chat_id, trace_id, pet_id, character["id"], started_at),
+        daemon=True,
+    ).start()
 
 
 def handle_action_button(chat_id: str, action: str) -> None:
-    pet_id = get_default_pet_id()
+    pet_id = get_current_pet_id(chat_id)
     response = requests.post(
         f"{API_BASE_URL}/virtual-pets/{pet_id}/actions",
+        **owner_params_kwarg(chat_id),
         json={"action": action},
         timeout=20,
     )
@@ -657,9 +2756,7 @@ def handle_action_button(chat_id: str, action: str) -> None:
         return
 
     result = response.json()
-    pet_response = requests.get(f"{API_BASE_URL}/pets", timeout=10)
-    pet_response.raise_for_status()
-    pets = pet_response.json()
+    pets = api_get_pets(chat_id)
     pet = next((item for item in pets if int(item["id"]) == pet_id), {"name": "宠物"})
     event_result = result.get("event_result") or {}
     generated_message = (event_result.get("message") or {}).get("message")
@@ -676,19 +2773,40 @@ def handle_action_button(chat_id: str, action: str) -> None:
 
 
 def handle_pending_text(chat_id: str, text: str) -> bool:
-    field = PENDING_SET_FIELDS.pop(chat_id, None)
-    if not field:
+    pending = PENDING_SET_FIELDS.pop(chat_id, None)
+    if not pending:
         return False
+    if pending.get("kind") == "profile_note":
+        pet_id = int(pending["pet_id"])
+        note_type = str(pending["note_type"])
+        try:
+            pet = update_pet_profile_note(pet_id, note_type, text, chat_id=chat_id)
+            target_labels = {
+                "species": "种类",
+                "speaking_style": "说话语气",
+            }
+            target = target_labels.get(note_type, "性格/行为资料")
+            send_message(
+                chat_id,
+                f"已补充 {pet['name']} 的{target}。之后群聊会参考这些细节。",
+                reply_markup=pet_settings_keyboard(pet_id),
+            )
+        except RuntimeError as exc:
+            send_message(chat_id, f"设置失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+
+    field = pending["field"]
+    pet_id = int(pending["pet_id"])
 
     try:
-        pet = update_default_pet(field, text)
+        pet = update_pet_by_id(pet_id, field, text, chat_id=chat_id)
         send_message(
             chat_id,
             f"设置好啦：{pet['name']} 的 {field} 已更新。",
-            reply_markup=SETTINGS_MENU,
+            reply_markup=pet_settings_keyboard(pet_id),
         )
     except RuntimeError as exc:
-        send_message(chat_id, f"设置失败：{exc}", reply_markup=SETTINGS_MENU)
+        send_message(chat_id, f"设置失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
     return True
 
 
@@ -697,7 +2815,7 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
     message = callback_query.get("message") or {}
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id", ""))
-    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+    if not is_chat_allowed(chat_id):
         return
 
     if callback_id:
@@ -716,16 +2834,97 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
     if data == "pets":
         handle_pets_command(chat_id)
         return
+    if data == "pets_group":
+        handle_pet_group_command(chat_id)
+        return
+    if data == "rel:start":
+        start_relationship_flow(chat_id)
+        return
+    if data.startswith("rel:source:"):
+        choose_relationship_source(chat_id, int(data.rsplit(":", 1)[1]))
+        return
+    if data.startswith("rel:target:"):
+        choose_relationship_target(chat_id, int(data.rsplit(":", 1)[1]))
+        return
+    if data.startswith("rel:label:"):
+        toggle_relationship_label(chat_id, data.rsplit(":", 1)[1])
+        return
+    if data == "rel:labels_done":
+        relationship_labels_done(chat_id)
+        return
+    if data == "rel:note_skip":
+        finish_relationship_flow(chat_id)
+        return
+    if data == "rel:cancel":
+        PENDING_RELATIONSHIP_FLOWS.pop(chat_id, None)
+        send_message(chat_id, "已取消宠物关系设置。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    if data.startswith("rel:reverse:"):
+        _prefix, _action, from_pet_id, to_pet_id = data.split(":", 3)
+        choose_relationship_source(chat_id, int(from_pet_id))
+        choose_relationship_target(chat_id, int(to_pet_id))
+        return
     if data == "desktop":
         handle_desktop_companion(chat_id)
         return
+    if data == "desktop:all":
+        handle_all_desktop_companions(chat_id)
+        return
+    if data.startswith("desktop:"):
+        handle_desktop_companion(chat_id, pet_id=int(data.rsplit(":", 1)[1]))
+        return
+    if data.startswith("pet_current:"):
+        try:
+            pet = set_current_pet(chat_id, int(data.rsplit(":", 1)[1]))
+            send_message(
+                chat_id,
+                f"接下来底部互动按钮会先照顾：{pet['name']}。\n这个聊天仍然是你和所有宠物的群聊。",
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            send_message(chat_id, f"指定互动对象失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    if data.startswith("pet_settings:"):
+        show_pet_settings(chat_id, int(data.rsplit(":", 1)[1]))
+        return
+    if data.startswith("stickers:generate:"):
+        start_sticker_pack_generation(chat_id, int(data.rsplit(":", 1)[1]))
+        return
+    if data == "pet_create:start":
+        start_pet_create_flow(chat_id)
+        return
+    if data.startswith("pet_create:species:"):
+        set_pet_create_species(chat_id, data.rsplit(":", 1)[1])
+        return
+    if data.startswith("pet_delete:ask:"):
+        ask_delete_pet(chat_id, int(data.rsplit(":", 1)[1]))
+        return
+    if data.startswith("pet_delete:confirm:"):
+        delete_pet_from_chat(chat_id, int(data.rsplit(":", 1)[1]))
+        return
     if data.startswith("prompt_set:"):
-        field = data.split(":", 1)[1]
-        PENDING_SET_FIELDS[chat_id] = field
-        send_message(chat_id, f"请输入新的 {field}。")
+        parts = data.split(":")
+        if len(parts) == 3:
+            _prefix, pet_id, field = parts
+            pet = find_pet(int(pet_id), chat_id=chat_id)
+            if pet is None:
+                send_message(chat_id, "这只宠物已经不存在了。", reply_markup=MAIN_REPLY_KEYBOARD)
+                return
+        else:
+            field = data.split(":", 1)[1]
+            pet = get_current_pet(chat_id)
+        PENDING_SET_FIELDS[chat_id] = {"field": field, "pet_id": int(pet["id"])}
+        send_message(chat_id, f"正在设置：{pet['name']}。\n请输入新的 {field}。")
+        return
+    if data.startswith("prompt_profile:"):
+        _prefix, pet_id, note_type = data.split(":", 2)
+        start_profile_note_flow(chat_id, int(pet_id), note_type)
         return
     if data == "set:avatar":
         start_avatar_flow(chat_id)
+        return
+    if data.startswith("set:avatar:"):
+        start_avatar_flow(chat_id, pet_id=int(data.rsplit(":", 1)[1]))
         return
     if data == "avatar:confirm":
         confirm_avatar_flow(chat_id)
@@ -748,7 +2947,7 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
     if data.startswith("set:"):
         _, field, value = data.split(":", 2)
         try:
-            pet = update_default_pet(field, value)
+            pet = update_current_pet(chat_id, field, value)
             send_message(
                 chat_id,
                 f"设置好啦：{pet['name']} 的 {field} 已更新为 {value}。",
@@ -756,6 +2955,18 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
             )
         except RuntimeError as exc:
             send_message(chat_id, f"设置失败：{exc}", reply_markup=SETTINGS_MENU)
+        return
+    if data.startswith("set_pet:"):
+        _prefix, pet_id, field, value = data.split(":", 3)
+        try:
+            pet = update_pet_by_id(int(pet_id), field, value, chat_id=chat_id)
+            send_message(
+                chat_id,
+                f"设置好啦：{pet['name']} 的 {field} 已更新为 {value}。",
+                reply_markup=pet_settings_keyboard(int(pet_id)),
+            )
+        except RuntimeError as exc:
+            send_message(chat_id, f"设置失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
         return
     if data.startswith("act:"):
         handle_action_button(chat_id, data.split(":", 1)[1])
@@ -767,15 +2978,24 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
 def handle_message(message: dict[str, Any]) -> None:
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id", ""))
-    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+    if not is_chat_allowed(chat_id):
+        send_message(chat_id, "当前需要邀请或订阅后才能使用这个宠物助手。")
         return
 
     text = (message.get("text") or "").strip()
     if handle_avatar_photo(chat_id, message):
         return
+    if handle_memory_photo(chat_id, message):
+        return
+    if handle_pet_create_text(chat_id, text):
+        return
+    if handle_relationship_text(chat_id, text):
+        return
     if handle_pending_text(chat_id, text):
         return
     if handle_avatar_style_text(chat_id, text):
+        return
+    if handle_memory_photo_text(chat_id, text):
         return
 
     if text.startswith("/start"):
@@ -786,14 +3006,21 @@ def handle_message(message: dict[str, Any]) -> None:
         handle_desktop_companion(chat_id)
     elif text == "宠物列表":
         handle_pets_command(chat_id)
+    elif text in {"宠物群聊", "选择宠物"}:
+        handle_pet_group_command(chat_id)
+    elif text == "宠物关系":
+        start_relationship_flow(chat_id)
+    elif text == "创建宠物":
+        start_pet_create_flow(chat_id)
     elif text == "设置资料":
-        send_settings_menu(chat_id)
+        send_message(chat_id, "资料设置已经移到「宠物列表」里，每只宠物卡片下都有设置入口。", reply_markup=MAIN_REPLY_KEYBOARD)
     elif text == "定制形象":
-        start_avatar_flow(chat_id)
+        remove_reply_keyboard(chat_id)
+        send_message(chat_id, "形象定制入口已经移到创建宠物后的下一步。", reply_markup=MAIN_REPLY_KEYBOARD)
     elif text in ACTION_BUTTON_MAP:
         handle_action_button(chat_id, ACTION_BUTTON_MAP[text])
-    else:
-        send_message(chat_id, "可以直接点下方按钮操作。", reply_markup=MAIN_REPLY_KEYBOARD)
+    elif handle_pet_group_chat_text(chat_id, text):
+        return
 
 
 def poll_forever() -> None:

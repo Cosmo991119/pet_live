@@ -22,7 +22,7 @@ def _rewrite_search_query(query: str, messages: list) -> str:
     return f"{context} >> {query}"
 
 # ── LLM 选择：改这一行切换 mock / 真实 ──
-# from llm_poe import poe_llm_call as llm_call   # 真实 POE
+# from llm_openai import openai_llm_call as llm_call   # 真实 OpenAI GPT
 # 未来换成 Anthropic：from llm_anthropic import anthropic_llm_call as llm_call
 USE_REAL_LLM = True    # 改成 True 启用真实 LLM
 
@@ -139,8 +139,8 @@ def run_agent(user_question: str, verbose: bool = True, history: list = None, sy
         for attempt in range(3):
             try:
                 if USE_REAL_LLM:
-                    from llm_poe import poe_llm_call
-                    response = poe_llm_call(build_llm_messages(), TOOLS)
+                    from llm_openai import openai_llm_call
+                    response = openai_llm_call(build_llm_messages(), TOOLS)
                 else:
                     response = mock_llm_call(build_llm_messages(), TOOLS)
                 break  # 成功就退出重试循环

@@ -14,7 +14,7 @@ from pet_db import save_event_message
 
 PET_EVENT_MESSAGE_PROMPT_VERSION = "pet_event_message_v1"
 FALLBACK_MODEL_NAME = "fallback-template"
-DEFAULT_LLM_MODEL_NAME = "poe-default"
+DEFAULT_LLM_MODEL_NAME = "openai-default"
 
 LLMCall = Callable[[list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]
 
@@ -152,9 +152,9 @@ def _build_prompt(
 
 
 def _call_default_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    from llm_poe import poe_llm_call
+    from llm_openai import openai_llm_call
 
-    return poe_llm_call(messages, [])
+    return openai_llm_call(messages, [])
 
 
 def generate_event_message(
@@ -189,7 +189,7 @@ def generate_event_message(
             result["severity"] = "normal"
         if not isinstance(result["facts_used"], list):
             result["facts_used"] = ["current_event"]
-        return result, DEFAULT_LLM_MODEL_NAME
+        return result, response.get("model", DEFAULT_LLM_MODEL_NAME)
     except Exception:
         return _fallback_message(pet, event, session), FALLBACK_MODEL_NAME
 

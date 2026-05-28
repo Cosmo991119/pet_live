@@ -8,6 +8,7 @@ data stored here, but factual state changes should not depend on the LLM.
 from pathlib import Path
 from datetime import date, datetime, time, timedelta
 import json
+import os
 import sqlite3
 from typing import Any, Optional, Union
 
@@ -18,6 +19,50 @@ ALLOWED_SPECIES = {"cat", "dog", "other"}
 ALLOWED_PERSONALITIES = {"sweet", "cool", "energetic", "gentle"}
 ALLOWED_BEHAVIORS = {"eat", "drink", "poop", "play", "sleep_start", "sleep_end"}
 SESSION_BEHAVIORS = {"eat", "drink", "poop", "play"}
+ALLOWED_RELATIONSHIP_LABELS = {
+    "often_replies_to_target",
+    "likes_staying_near_target",
+    "quiet_around_target",
+    "pulls_target_to_play",
+    "keeps_distance_from_target",
+}
+ALLOWED_MEMORY_TYPES = {
+    "owner_shared",
+    "co_experienced",
+    "pet_milestone",
+    "work_companion",
+}
+ALLOWED_MEMORY_SOURCES = {
+    "manual",
+    "telegram",
+    "desktop",
+    "event",
+    "summary",
+    "assistant",
+}
+ALLOWED_MEMORY_VISIBILITIES = {"home", "private"}
+MEMORY_PARTICIPANT_ROLES = {
+    "owner_shared": "shared_with",
+    "co_experienced": "participant",
+    "pet_milestone": "subject",
+    "work_companion": "helper",
+}
+MEMORY_RECALL_GUIDANCE = {
+    "owner_shared": (
+        "Pets may recall that the owner shared this moment with them, "
+        "but must not claim physical presence."
+    ),
+    "co_experienced": (
+        "Only participant pets may recall this as a lived shared experience; "
+        "non-participants may only know it was discussed."
+    ),
+    "pet_milestone": (
+        "Recall as a pet state or growth milestone grounded in product facts."
+    ),
+    "work_companion": (
+        "Recall as a work-help moment; avoid storing or repeating secrets."
+    ),
+}
 CONFIDENCE_NOTIFY_THRESHOLD = 0.7
 RAW_EVENT_RETENTION_DAYS = 90
 SESSION_WINDOWS_SECONDS = {
@@ -192,8 +237,17 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
     with connect(db_path) as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS owners (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_chat_id TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS pets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 pet_mode TEXT NOT NULL DEFAULT 'real' CHECK (
                     pet_mode IN ('real', 'virtual')
@@ -204,7 +258,8 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
                 ),
                 owner_call_name TEXT NOT NULL,
                 profile_json TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (owner_id) REFERENCES owners(id)
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -356,18 +411,212 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (pet_id) REFERENCES pets(id)
             );
+
+            CREATE TABLE IF NOT EXISTS pet_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_pet_id INTEGER NOT NULL,
+                to_pet_id INTEGER NOT NULL,
+                labels_json TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                muted INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK (from_pet_id != to_pet_id),
+                UNIQUE (from_pet_id, to_pet_id),
+                FOREIGN KEY (from_pet_id) REFERENCES pets(id),
+                FOREIGN KEY (to_pet_id) REFERENCES pets(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pet_relationships_from_pet
+            ON pet_relationships (from_pet_id);
+
+            CREATE INDEX IF NOT EXISTS idx_pet_relationships_to_pet
+            ON pet_relationships (to_pet_id);
+
+            CREATE TABLE IF NOT EXISTS pet_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_type TEXT NOT NULL CHECK (
+                    memory_type IN (
+                        'owner_shared',
+                        'co_experienced',
+                        'pet_milestone',
+                        'work_companion'
+                    )
+                ),
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                source TEXT NOT NULL CHECK (
+                    source IN (
+                        'manual',
+                        'telegram',
+                        'desktop',
+                        'event',
+                        'summary',
+                        'assistant'
+                    )
+                ),
+                emotional_tone TEXT NOT NULL DEFAULT '',
+                importance INTEGER NOT NULL DEFAULT 3 CHECK (
+                    importance >= 1 AND importance <= 5
+                ),
+                visibility TEXT NOT NULL DEFAULT 'home' CHECK (
+                    visibility IN ('home', 'private')
+                ),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pet_memories_type_created
+            ON pet_memories (memory_type, created_at);
+
+            CREATE TABLE IF NOT EXISTS pet_memory_participants (
+                memory_id INTEGER NOT NULL,
+                pet_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (
+                    role IN ('shared_with', 'participant', 'subject', 'helper')
+                ),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (memory_id, pet_id),
+                FOREIGN KEY (memory_id) REFERENCES pet_memories(id) ON DELETE CASCADE,
+                FOREIGN KEY (pet_id) REFERENCES pets(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pet_memory_participants_pet
+            ON pet_memory_participants (pet_id, memory_id);
             """
         )
         if not _column_exists(conn, "pets", "pet_mode"):
             conn.execute(
                 "ALTER TABLE pets ADD COLUMN pet_mode TEXT NOT NULL DEFAULT 'real'"
             )
+        if not _column_exists(conn, "pets", "owner_id"):
+            conn.execute("ALTER TABLE pets ADD COLUMN owner_id INTEGER")
+        _assign_existing_pets_to_default_owner(conn)
         _migrate_play_behavior(conn)
     return db_path
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row)
+
+
+def _default_owner_chat_id() -> str:
+    return (
+        os.getenv("TELEGRAM_DEFAULT_OWNER_CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT_ID")
+        or "__default_owner__"
+    )
+
+
+def _default_owner_display_name() -> str:
+    return os.getenv("TELEGRAM_DEFAULT_OWNER_DISPLAY_NAME") or "Default Owner"
+
+
+def _ensure_owner_for_telegram_chat(
+    conn: sqlite3.Connection,
+    telegram_chat_id: str,
+    display_name: str = "",
+) -> dict[str, Any]:
+    chat_id = str(telegram_chat_id).strip()
+    if not chat_id:
+        raise ValueError("telegram_chat_id is required")
+    name = str(display_name or "").strip()
+    conn.execute(
+        """
+        INSERT INTO owners (telegram_chat_id, display_name, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(telegram_chat_id) DO UPDATE SET
+            display_name = CASE
+                WHEN excluded.display_name != '' THEN excluded.display_name
+                ELSE owners.display_name
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (chat_id, name),
+    )
+    row = conn.execute(
+        "SELECT * FROM owners WHERE telegram_chat_id = ?",
+        (chat_id,),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def _assign_existing_pets_to_default_owner(conn: sqlite3.Connection) -> None:
+    default_owner = _ensure_owner_for_telegram_chat(
+        conn,
+        _default_owner_chat_id(),
+        _default_owner_display_name(),
+    )
+    conn.execute(
+        "UPDATE pets SET owner_id = ? WHERE owner_id IS NULL",
+        (default_owner["id"],),
+    )
+
+
+def create_owner_for_telegram_chat(
+    telegram_chat_id: str,
+    display_name: str = "",
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Create or update an owner identified by Telegram chat id."""
+    with connect(db_path) as conn:
+        return _ensure_owner_for_telegram_chat(conn, telegram_chat_id, display_name)
+
+
+def get_owner_by_telegram_chat(
+    telegram_chat_id: str,
+    db_path: DbPath = DB_PATH,
+) -> Optional[dict[str, Any]]:
+    """Return an owner by Telegram chat id, or None if missing."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM owners WHERE telegram_chat_id = ?",
+            (str(telegram_chat_id),),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def _resolve_owner_id(conn: sqlite3.Connection, owner_id: Optional[int]) -> int:
+    if owner_id is None:
+        owner = _ensure_owner_for_telegram_chat(
+            conn,
+            _default_owner_chat_id(),
+            _default_owner_display_name(),
+        )
+        return int(owner["id"])
+    owner = conn.execute("SELECT id FROM owners WHERE id = ?", (owner_id,)).fetchone()
+    if owner is None:
+        raise ValueError(f"owner_id {owner_id} does not exist")
+    return int(owner["id"])
+
+
+def _normalize_relationship_labels(labels: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for label in labels:
+        value = str(label).strip()
+        if not value:
+            continue
+        if value not in ALLOWED_RELATIONSHIP_LABELS:
+            raise ValueError(
+                f"relationship label must be one of {sorted(ALLOWED_RELATIONSHIP_LABELS)}"
+            )
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _relationship_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_to_dict(row)
+    data["labels"] = json.loads(data.get("labels_json") or "[]")
+    data["muted"] = bool(data["muted"])
+    return data
+
+
+def _ensure_pet_exists(conn: sqlite3.Connection, pet_id: int, field_name: str) -> None:
+    pet = conn.execute("SELECT id FROM pets WHERE id = ?", (pet_id,)).fetchone()
+    if pet is None:
+        raise ValueError(f"{field_name} {pet_id} does not exist")
 
 
 def create_pet(
@@ -377,6 +626,7 @@ def create_pet(
     owner_call_name: str,
     pet_mode: str = "real",
     profile: Optional[dict[str, Any]] = None,
+    owner_id: Optional[int] = None,
     db_path: DbPath = DB_PATH,
 ) -> dict[str, Any]:
     """Create a pet record and return it as a dictionary."""
@@ -396,9 +646,11 @@ def create_pet(
     profile_json = json.dumps(profile or {}, ensure_ascii=False)
 
     with connect(db_path) as conn:
+        resolved_owner_id = _resolve_owner_id(conn, owner_id)
         cursor = conn.execute(
             """
             INSERT INTO pets (
+                owner_id,
                 name,
                 pet_mode,
                 species,
@@ -406,9 +658,17 @@ def create_pet(
                 owner_call_name,
                 profile_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, pet_mode, species, personality, owner_call_name, profile_json),
+            (
+                resolved_owner_id,
+                name,
+                pet_mode,
+                species,
+                personality,
+                owner_call_name,
+                profile_json,
+            ),
         )
         pet_id = cursor.lastrowid
         row = conn.execute("SELECT * FROM pets WHERE id = ?", (pet_id,)).fetchone()
@@ -424,6 +684,7 @@ def update_pet(
     owner_call_name: Optional[str] = None,
     pet_mode: Optional[str] = None,
     profile: Optional[dict[str, Any]] = None,
+    owner_id: Optional[int] = None,
     db_path: DbPath = DB_PATH,
 ) -> dict[str, Any]:
     """Partially update a pet profile and return the updated row."""
@@ -462,7 +723,15 @@ def update_pet(
         params.append(json.dumps(profile, ensure_ascii=False))
 
     with connect(db_path) as conn:
-        pet = conn.execute("SELECT id FROM pets WHERE id = ?", (pet_id,)).fetchone()
+        clauses = ["id = ?"]
+        lookup_params: list[Any] = [pet_id]
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            lookup_params.append(owner_id)
+        pet = conn.execute(
+            f"SELECT id FROM pets WHERE {' AND '.join(clauses)}",
+            lookup_params,
+        ).fetchone()
         if pet is None:
             raise ValueError(f"pet_id {pet_id} does not exist")
 
@@ -476,6 +745,431 @@ def update_pet(
         row = conn.execute("SELECT * FROM pets WHERE id = ?", (pet_id,)).fetchone()
 
     return _row_to_dict(row)
+
+
+def delete_pet(
+    pet_id: int,
+    owner_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Delete one pet and local dependent demo data."""
+    with connect(db_path) as conn:
+        clauses = ["id = ?"]
+        lookup_params: list[Any] = [pet_id]
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            lookup_params.append(owner_id)
+        row = conn.execute(
+            f"SELECT * FROM pets WHERE {' AND '.join(clauses)}",
+            lookup_params,
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"pet_id {pet_id} does not exist")
+
+        pet = _row_to_dict(row)
+        conn.execute("DELETE FROM event_messages WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM summaries WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM anomalies WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM sleep_sessions WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM behavior_sessions WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM virtual_pet_states WHERE pet_id = ?", (pet_id,))
+        conn.execute(
+            "DELETE FROM pet_relationships WHERE from_pet_id = ? OR to_pet_id = ?",
+            (pet_id, pet_id),
+        )
+        memory_rows = conn.execute(
+            """
+            SELECT memory_id
+            FROM pet_memory_participants
+            WHERE pet_id = ?
+            """,
+            (pet_id,),
+        ).fetchall()
+        memory_ids = [row["memory_id"] for row in memory_rows]
+        conn.execute("DELETE FROM pet_memory_participants WHERE pet_id = ?", (pet_id,))
+        for memory_id in memory_ids:
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM pet_memory_participants
+                WHERE memory_id = ?
+                """,
+                (memory_id,),
+            ).fetchone()["count"]
+            if remaining == 0:
+                conn.execute("DELETE FROM pet_memories WHERE id = ?", (memory_id,))
+        conn.execute("DELETE FROM archived_events WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM events WHERE pet_id = ?", (pet_id,))
+        conn.execute("DELETE FROM pets WHERE id = ?", (pet_id,))
+
+    return pet
+
+
+def upsert_pet_relationship(
+    from_pet_id: int,
+    to_pet_id: int,
+    labels: list[str],
+    note: str = "",
+    muted: bool = False,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Create or update one directed pet relationship edge."""
+    if int(from_pet_id) == int(to_pet_id):
+        raise ValueError("from_pet_id and to_pet_id must be different")
+    normalized_labels = _normalize_relationship_labels(labels)
+    labels_json = json.dumps(normalized_labels, ensure_ascii=False)
+    note = str(note or "").strip()
+
+    with connect(db_path) as conn:
+        _ensure_pet_exists(conn, from_pet_id, "from_pet_id")
+        _ensure_pet_exists(conn, to_pet_id, "to_pet_id")
+        conn.execute(
+            """
+            INSERT INTO pet_relationships (
+                from_pet_id,
+                to_pet_id,
+                labels_json,
+                note,
+                muted,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(from_pet_id, to_pet_id) DO UPDATE SET
+                labels_json = excluded.labels_json,
+                note = excluded.note,
+                muted = excluded.muted,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (from_pet_id, to_pet_id, labels_json, note, 1 if muted else 0),
+        )
+        row = conn.execute(
+            """
+            SELECT r.*, fp.name AS from_pet_name, tp.name AS to_pet_name
+            FROM pet_relationships r
+            JOIN pets fp ON fp.id = r.from_pet_id
+            JOIN pets tp ON tp.id = r.to_pet_id
+            WHERE r.from_pet_id = ? AND r.to_pet_id = ?
+            """,
+            (from_pet_id, to_pet_id),
+        ).fetchone()
+    return _relationship_row_to_dict(row)
+
+
+def get_pet_relationship(
+    from_pet_id: int,
+    to_pet_id: int,
+    db_path: DbPath = DB_PATH,
+) -> Optional[dict[str, Any]]:
+    """Return one directed relationship edge, or None if missing."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, fp.name AS from_pet_name, tp.name AS to_pet_name
+            FROM pet_relationships r
+            JOIN pets fp ON fp.id = r.from_pet_id
+            JOIN pets tp ON tp.id = r.to_pet_id
+            WHERE r.from_pet_id = ? AND r.to_pet_id = ?
+            """,
+            (from_pet_id, to_pet_id),
+        ).fetchone()
+    return _relationship_row_to_dict(row) if row else None
+
+
+def list_pet_relationships(
+    pet_id: Optional[int] = None,
+    from_pet_id: Optional[int] = None,
+    to_pet_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> list[dict[str, Any]]:
+    """List directed relationship edges, optionally filtered by pet."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if pet_id is not None:
+        clauses.append("(r.from_pet_id = ? OR r.to_pet_id = ?)")
+        params.extend([pet_id, pet_id])
+    if from_pet_id is not None:
+        clauses.append("r.from_pet_id = ?")
+        params.append(from_pet_id)
+    if to_pet_id is not None:
+        clauses.append("r.to_pet_id = ?")
+        params.append(to_pet_id)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT r.*, fp.name AS from_pet_name, tp.name AS to_pet_name
+            FROM pet_relationships r
+            JOIN pets fp ON fp.id = r.from_pet_id
+            JOIN pets tp ON tp.id = r.to_pet_id
+            {where_sql}
+            ORDER BY fp.name ASC, tp.name ASC, r.id ASC
+            """,
+            params,
+        ).fetchall()
+    return [_relationship_row_to_dict(row) for row in rows]
+
+
+def set_pet_relationship_muted(
+    from_pet_id: int,
+    to_pet_id: int,
+    muted: bool,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Set the natural-language expression mute flag for one relationship edge."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM pet_relationships
+            WHERE from_pet_id = ? AND to_pet_id = ?
+            """,
+            (from_pet_id, to_pet_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("pet relationship does not exist")
+        conn.execute(
+            """
+            UPDATE pet_relationships
+            SET muted = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE from_pet_id = ? AND to_pet_id = ?
+            """,
+            (1 if muted else 0, from_pet_id, to_pet_id),
+        )
+    relationship = get_pet_relationship(from_pet_id, to_pet_id, db_path=db_path)
+    if relationship is None:
+        raise ValueError("pet relationship does not exist")
+    return relationship
+
+
+def delete_pet_relationship(
+    from_pet_id: int,
+    to_pet_id: int,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Hard-delete one directed relationship edge."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, fp.name AS from_pet_name, tp.name AS to_pet_name
+            FROM pet_relationships r
+            JOIN pets fp ON fp.id = r.from_pet_id
+            JOIN pets tp ON tp.id = r.to_pet_id
+            WHERE r.from_pet_id = ? AND r.to_pet_id = ?
+            """,
+            (from_pet_id, to_pet_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("pet relationship does not exist")
+        conn.execute(
+            "DELETE FROM pet_relationships WHERE from_pet_id = ? AND to_pet_id = ?",
+            (from_pet_id, to_pet_id),
+        )
+    return _relationship_row_to_dict(row)
+
+
+def _normalize_memory_type(memory_type: str) -> str:
+    value = str(memory_type or "").strip()
+    if value not in ALLOWED_MEMORY_TYPES:
+        raise ValueError(f"memory_type must be one of {sorted(ALLOWED_MEMORY_TYPES)}")
+    return value
+
+
+def _normalize_memory_source(source: str) -> str:
+    value = str(source or "manual").strip() or "manual"
+    if value not in ALLOWED_MEMORY_SOURCES:
+        raise ValueError(f"source must be one of {sorted(ALLOWED_MEMORY_SOURCES)}")
+    return value
+
+
+def _normalize_memory_visibility(visibility: str) -> str:
+    value = str(visibility or "home").strip() or "home"
+    if value not in ALLOWED_MEMORY_VISIBILITIES:
+        raise ValueError(
+            f"visibility must be one of {sorted(ALLOWED_MEMORY_VISIBILITIES)}"
+        )
+    return value
+
+
+def _normalize_pet_ids(pet_ids: list[int]) -> list[int]:
+    normalized: list[int] = []
+    for pet_id in pet_ids:
+        value = int(pet_id)
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _memory_row_to_dict(
+    row: sqlite3.Row,
+    participants: list[sqlite3.Row],
+) -> dict[str, Any]:
+    data = _row_to_dict(row)
+    data["metadata"] = json.loads(data.get("metadata_json") or "{}")
+    data["participants"] = [
+        {
+            "pet_id": participant["pet_id"],
+            "pet_name": participant["pet_name"],
+            "role": participant["role"],
+        }
+        for participant in participants
+    ]
+    data["participant_pet_ids"] = [
+        participant["pet_id"] for participant in data["participants"]
+    ]
+    data["recall_guidance"] = MEMORY_RECALL_GUIDANCE[data["memory_type"]]
+    return data
+
+
+def _fetch_pet_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute("SELECT * FROM pet_memories WHERE id = ?", (memory_id,)).fetchone()
+    if row is None:
+        return None
+    participants = conn.execute(
+        """
+        SELECT mp.pet_id, mp.role, p.name AS pet_name
+        FROM pet_memory_participants mp
+        JOIN pets p ON p.id = mp.pet_id
+        WHERE mp.memory_id = ?
+        ORDER BY mp.created_at ASC, mp.pet_id ASC
+        """,
+        (memory_id,),
+    ).fetchall()
+    return _memory_row_to_dict(row, participants)
+
+
+def create_pet_memory(
+    memory_type: str,
+    content: str,
+    participant_pet_ids: list[int],
+    title: str = "",
+    source: str = "manual",
+    emotional_tone: str = "",
+    importance: int = 3,
+    visibility: str = "home",
+    metadata: Optional[dict[str, Any]] = None,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Create one durable pet-owner memory with explicit pet participants."""
+    memory_type = _normalize_memory_type(memory_type)
+    source = _normalize_memory_source(source)
+    visibility = _normalize_memory_visibility(visibility)
+    content = str(content or "").strip()
+    if not content:
+        raise ValueError("content is required")
+    if importance < 1 or importance > 5:
+        raise ValueError("importance must be between 1 and 5")
+
+    participant_pet_ids = _normalize_pet_ids(participant_pet_ids)
+    if not participant_pet_ids:
+        raise ValueError("participant_pet_ids must include at least one pet")
+
+    role = MEMORY_PARTICIPANT_ROLES[memory_type]
+    metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+
+    with connect(db_path) as conn:
+        for pet_id in participant_pet_ids:
+            _ensure_pet_exists(conn, pet_id, "participant_pet_id")
+
+        cursor = conn.execute(
+            """
+            INSERT INTO pet_memories (
+                memory_type,
+                title,
+                content,
+                source,
+                emotional_tone,
+                importance,
+                visibility,
+                metadata_json,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                memory_type,
+                str(title or "").strip(),
+                content,
+                source,
+                str(emotional_tone or "").strip(),
+                importance,
+                visibility,
+                metadata_json,
+            ),
+        )
+        memory_id = cursor.lastrowid
+        conn.executemany(
+            """
+            INSERT INTO pet_memory_participants (memory_id, pet_id, role)
+            VALUES (?, ?, ?)
+            """,
+            [(memory_id, pet_id, role) for pet_id in participant_pet_ids],
+        )
+        memory = _fetch_pet_memory(conn, memory_id)
+    if memory is None:
+        raise RuntimeError("created pet memory could not be loaded")
+    return memory
+
+
+def get_pet_memory(
+    memory_id: int,
+    db_path: DbPath = DB_PATH,
+) -> Optional[dict[str, Any]]:
+    """Return one durable pet memory, or None if missing."""
+    with connect(db_path) as conn:
+        return _fetch_pet_memory(conn, memory_id)
+
+
+def list_pet_memories(
+    pet_id: Optional[int] = None,
+    memory_type: Optional[str] = None,
+    visibility: Optional[str] = None,
+    limit: int = 20,
+    db_path: DbPath = DB_PATH,
+) -> list[dict[str, Any]]:
+    """List recent durable pet memories, optionally filtered by pet and type."""
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
+    clauses: list[str] = []
+    params: list[Any] = []
+    if memory_type is not None:
+        clauses.append("m.memory_type = ?")
+        params.append(_normalize_memory_type(memory_type))
+    if visibility is not None:
+        clauses.append("m.visibility = ?")
+        params.append(_normalize_memory_visibility(visibility))
+    if pet_id is not None:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM pet_memory_participants mp_filter
+                WHERE mp_filter.memory_id = m.id AND mp_filter.pet_id = ?
+            )
+            """
+        )
+        params.append(pet_id)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT m.*
+            FROM pet_memories m
+            {where_sql}
+            ORDER BY m.created_at DESC, m.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        memories: list[dict[str, Any]] = []
+        for row in rows:
+            memory = _fetch_pet_memory(conn, row["id"])
+            if memory is not None:
+                memories.append(memory)
+    return memories
 
 
 def save_virtual_pet_state(
@@ -525,18 +1219,40 @@ def get_virtual_pet_state(
     return _row_to_dict(row) if row else None
 
 
-def get_pet(pet_id: int, db_path: DbPath = DB_PATH) -> Optional[dict[str, Any]]:
+def get_pet(
+    pet_id: int,
+    owner_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> Optional[dict[str, Any]]:
     """Return one pet by id, or None if it does not exist."""
     with connect(db_path) as conn:
-        row = conn.execute("SELECT * FROM pets WHERE id = ?", (pet_id,)).fetchone()
+        clauses = ["id = ?"]
+        params: list[Any] = [pet_id]
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        row = conn.execute(
+            f"SELECT * FROM pets WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
     return _row_to_dict(row) if row else None
 
 
-def list_pets(db_path: DbPath = DB_PATH) -> list[dict[str, Any]]:
-    """Return all pets ordered by creation time."""
+def list_pets(
+    owner_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> list[dict[str, Any]]:
+    """Return pets ordered by creation time, optionally scoped to one owner."""
     with connect(db_path) as conn:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = conn.execute(
-            "SELECT * FROM pets ORDER BY created_at ASC, id ASC"
+            f"SELECT * FROM pets {where_sql} ORDER BY created_at ASC, id ASC",
+            params,
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
 

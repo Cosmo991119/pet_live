@@ -19,6 +19,68 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
 
 
+def _matching_process_groups(command_fragment: str) -> dict[int, list[int]]:
+    """Return process groups for existing commands that match this product loop."""
+    try:
+        output = subprocess.check_output(
+            ["ps", "-axo", "pid=,pgid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    current_pid = os.getpid()
+    current_pgid = os.getpgid(0)
+    groups: dict[int, list[int]] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        if pid == current_pid or pgid == current_pgid:
+            continue
+        if " rg " in f" {command} " or " grep " in f" {command} ":
+            continue
+        if command_fragment not in command:
+            continue
+        groups.setdefault(pgid, []).append(pid)
+    return groups
+
+
+def _stop_existing_process_groups(label: str, command_fragment: str) -> None:
+    groups = _matching_process_groups(command_fragment)
+    if not groups:
+        return
+
+    for pgid, pids in groups.items():
+        print(f"stopping existing {label} process group pgid={pgid}, pids={','.join(map(str, pids))}")
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            print(f"could not stop existing {label} pgid={pgid}: {exc}")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not _matching_process_groups(command_fragment):
+            return
+        time.sleep(0.2)
+
+    for pgid in _matching_process_groups(command_fragment):
+        print(f"force stopping existing {label} process group pgid={pgid}")
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
 def _open_log(name: str):
     LOG_DIR.mkdir(exist_ok=True)
     path = LOG_DIR / name
@@ -74,6 +136,8 @@ def main() -> int:
     ]
     if not args.no_reload:
         api_command.append("--reload")
+
+    _stop_existing_process_groups("telegram", "telegram_bot.py")
 
     processes: list[tuple[str, subprocess.Popen, object]] = [
         _start_process("fastapi", api_command, "fastapi.log"),

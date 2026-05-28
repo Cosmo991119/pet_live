@@ -4,7 +4,7 @@
 
 用户提问 -> LLM 判断是否调用工具 -> 工具返回结果 -> LLM 汇总回答。
 
-项目还包含多轮历史、简单长期记忆、本地知识库检索、POE/OpenAI-compatible LLM 适配，以及一个未默认启用的 Anthropic 适配层。
+项目还包含多轮历史、简单长期记忆、本地知识库检索、OpenAI GPT LLM 适配，以及一个未默认启用的 Anthropic 适配层。
 
 ## 主要入口
 
@@ -30,7 +30,7 @@ python3 main.py
 uvicorn api:app --reload
 ```
 
-打开 `http://127.0.0.1:8000`。如果要使用 Image Style 功能，需要在 `.env` 中配置 Poe API：
+打开 `http://127.0.0.1:8000`。如果要使用真实 LLM 或 Image Style 功能，需要在 `.env` 中配置 OpenAI API：
 
 运行桌面宠物 + Telegram 产品链路：
 
@@ -43,11 +43,12 @@ python3 run_pet_agent.py
 `python3 telegram_bot.py` 更适合调试。
 
 ```bash
-POE_API_KEY=...
-POE_IMAGE_MODEL=gpt-image-1.5
+OPENAI_API_KEY=...
+OPENAI_LLM_MODEL=gpt-5.5
+OPENAI_IMAGE_MODEL=gpt-image-1.5
 ```
 
-`POE_IMAGE_MODEL` 可省略，默认使用 `gpt-image-1.5`。页面会把上传的参考图和额外要求提交到 `/image-style`，后端会保留原图服装、配色和主要装饰，并固定转换成大块、干净、适合 3D 打印的像素方块 Q 版手办风，生成结果保存到 `static/generated/`。
+`OPENAI_LLM_MODEL` 可省略，默认使用 `gpt-5.5`。`OPENAI_IMAGE_MODEL` 可省略，默认使用 `gpt-image-1.5`。页面和 Telegram 会把上传的参考图和额外要求提交到 `/image-style`，后端会保留原图服装、配色、主体结构、姿势和主要装饰，并固定转换成复古 16/32-bit 像素 Q 版桌宠头像/精灵风。生成结果优先透明底，强调清晰像素块和干净色块，避免明显反光、脏光晕和复杂背景，保存到 `static/generated/`。
 
 ## 核心模块
 
@@ -55,9 +56,9 @@ POE_IMAGE_MODEL=gpt-image-1.5
 - `tools.py`：工具注册和执行分发。包含知识库搜索、天气、mock web search、计算、时间、保存 note、读取 note。
 - `rag.py`：本地 RAG。读取 `knowledge_base/*.txt`，切 chunk，用 `sentence-transformers` 向量化，存入 ChromaDB。
 - `prompts.py`：系统提示词。规定中文回答、数学必须用工具、公司政策类问题先查知识库等。
-- `llm_poe.py`：POE 的 OpenAI-compatible API 适配层，把 OpenAI tool call 格式转成项目内部使用的 Anthropic-like 格式。
+- `llm_openai.py`：OpenAI GPT API 适配层，把 OpenAI tool call 格式转成项目内部使用的 Anthropic-like 格式。
 - `llm_anthropic.py`：Anthropic API 适配层，目前不是默认路径。
-- `image_style_agent.py`：图片风格转换服务。读取上传图片，调用 Poe 图像模型，保存生成图。
+- `image_style_agent.py`：图片风格转换服务。读取上传图片，调用 OpenAI GPT Image 模型，保存生成图。
 - `image_styles/`：图片风格注册表。每个风格独立维护 prompt，前端通过 `/image-styles` 动态加载风格列表。
 - `notes.json`：简单持久化记忆文件。
 - `knowledge_base/`：本地知识库原始资料。
@@ -65,12 +66,12 @@ POE_IMAGE_MODEL=gpt-image-1.5
 
 ## 当前默认行为
 
-`agent.py` 中 `USE_REAL_LLM = True`，所以默认走 `llm_poe.py`。
+`agent.py` 中 `USE_REAL_LLM = True`，所以默认走 `llm_openai.py`。
 
 需要在 `.env` 中配置：
 
 ```bash
-POE_API_KEY=...
+OPENAI_API_KEY=...
 ```
 
 如果要切换到 mock LLM，可在 `agent.py` 中把 `USE_REAL_LLM` 改为 `False`。
