@@ -1,38 +1,82 @@
-**User Goal**
+# Context Handoff
 
-Continue `/Users/cosmos/agent-demo`, a Chinese Telegram + desktop AI pet companion. Latest task: merge branch `codex-pet-friendship-invites` into `main`.
+## Current Objective
 
-**Current State**
+Project: `/Users/cosmos/agent-demo`. Active thread: make Telegram/proactive pet
+messages feel personality-aware instead of templated status reports.
 
-- Current branch is intended to be `main`.
-- `codex-pet-friendship-invites` was merged into `main` with merge commit `56ec442` after feature commit `edd5bd8`.
-- The merged feature adds V1 cross-owner pet friendship invites:
-  - DB tables and helpers in `pet_db.py`: `pet_friendship_invites`, `pet_friendships`, `create_pet_friendship_invite(...)`, `get_pet_friendship_invite(...)`, `accept_pet_friendship_invite(...)`, `list_pet_friendships(...)`.
-  - API endpoints in `api.py`: create/get/accept invite and list friendships.
-  - Telegram UX in `telegram_bot.py`: `宠物好友`, invite generation, `/pet_friend_invite <token>` / `/friend <token>`, and receiver pet selection.
-  - Tests for DB constraints, API pass-through, and Telegram invite generation/acceptance.
-- `AGENTS.md` has an auto-refreshed timestamp line that changed repeatedly during git operations. Preserve it rather than reverting.
-- Temporary stash `stash@{0}: On main: preserve-agents-timestamp` was created while handling the auto timestamp; its contents are superseded by committed/newer `AGENTS.md` state if still present.
+## Current State
 
-**Recent Change**
+User shared a Telegram screenshot on 2026-06-02 and said replies feel
+mechanical. The problematic pattern was repeated text like
+`刚刚去厕所了，状态看起来还平稳`, `刚刚喝了点水，你不用担心`, and
+`一切都在掌控中`: factually correct, but too close to monitoring software.
 
-- Created feature commit `edd5bd8 Add pet friendship invites` on `codex-pet-friendship-invites`.
-- Created `main` commit `921ff62 Refresh agent context timestamp` to protect an automatic `AGENTS.md` timestamp update before merging.
-- Merged `codex-pet-friendship-invites` into `main` with `56ec442`.
-- After merge, refreshed `.agents/context-handoff.md` to record the merge result.
+Implemented the first fix in `pet_message_agent.py`:
 
-**Artifact Trail**
+- Added `PERSONALITY_VOICE_GUIDES` for `sweet`, `cool`, `energetic`, and
+  `gentle`.
+- LLM prompt now passes `pet.personality_voice_guide` and explicitly requires
+  matching the pet's `性格语气`.
+- Prompt now says: do not start every message with the owner call name, do not
+  write as monitoring/status broadcast, and avoid filler such as `状态`,
+  `平稳`, `掌控`, `不用担心`, `任务完成`.
+- Fallback templates now vary by behavior and personality with small embodied
+  details and fewer cloned sentence frames.
 
-- Modified/merged: `.agents/context-handoff.md`, `AGENTS.md`, `CONTEXT.md`, `api.py`, `docs/pet-agent-tasks.md`, `pet_db.py`, `telegram_bot.py`, `tests/test_api_pet_create.py`, `tests/test_telegram_pet_onboarding.py`.
-- Added: `tests/test_pet_friendships.py`.
+Sample fallback tone after the change:
 
-**Verification**
+- gentle: `妈，我刚才去喝了几口水，会慢慢照顾好自己。`
+- energetic: `妈！我喝水啦，咕嘟咕嘟，像给自己重新开机了一下。`
+- cool: `妈，我顺路喝了点水。别看我，我只是刚好路过。`
+- sweet: `妈，糯米刚刚去喝水啦，水碗边今天有点像我的快乐小基地。`
 
-- Before merge: `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache-friend-tests python3 -m unittest tests.test_pet_friendships tests.test_api_pet_create tests.test_telegram_pet_onboarding` passed: 84 tests.
-- Before merge: `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache-friend-compile python3 -m py_compile api.py pet_db.py telegram_bot.py tests/test_pet_friendships.py tests/test_api_pet_create.py tests/test_telegram_pet_onboarding.py` passed.
-- After merge: same targeted unittest command passed: 84 tests.
-- After merge: same `py_compile` command passed.
+## Product Decisions
 
-**Next Recommended Step**
+Preserve `docs/pet-agent-prd.md`: realtime messages should sound like pets
+talking to the owner, be close and characterful, use data in the background,
+avoid direct report-like wording, and avoid medical diagnosis.
 
-If continuing this branch, clean up the temporary stash if it is still present and push `main` if remote publishing is desired.
+Durable copy direction:
+
+- Different pets should sound like different characters, not the same template
+  with names swapped.
+- Prefer action/location/body details over generic reassurance.
+- Use owner call names sparingly.
+- Avoid clinical/system words in casual pet messages unless a real warning
+  needs them.
+
+## Artifact Trail
+
+- Modified this turn:
+  - `.agents/context-handoff.md`
+  - `pet_message_agent.py`
+  - `tests/test_pet_event_notifications.py`
+- Read this turn:
+  - `/Users/cosmos/.agents/skills/next-day-context/SKILL.md`
+  - `/Users/cosmos/.agents/skills/disciplined-dev-workflow/SKILL.md`
+  - `/Users/cosmos/.agents/skills/tdd/SKILL.md`
+  - `/Users/cosmos/.agents/skills/code-reviewer/SKILL.md`
+  - `docs/pet-agent-prd.md`
+  - `docs/pet-agent-tasks.md`
+  - `telegram_bot.py`, `pet_status_service.py`, `notifier.py` snippets
+
+## Verification
+
+- `python3 -m unittest tests.test_pet_event_notifications` passed: 5 tests.
+- `python3 -m unittest tests.test_pet_event_notifications tests.test_telegram_pet_onboarding` passed: 94 tests.
+- `python3 -m py_compile pet_message_agent.py tests/test_pet_event_notifications.py` passed.
+- `python` is unavailable in this shell; use `python3`.
+
+## Constraints / Preferences
+
+The worktree contains many pre-existing unrelated modified/untracked files.
+Leave them untouched unless the user explicitly asks. Follow `AGENTS.md`: after
+code changes, self-review and focused verification are required before final
+response.
+
+## Next Step
+
+Run the bot/API and watch one proactive tick cycle with multiple pets. If live
+messages still feel repetitive, add recent-message memory or a short per-chat
+copy cooldown so the LLM can avoid repeating sentence shapes across a burst.
