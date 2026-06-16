@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageOps, ImageSequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -60,8 +61,11 @@ ANIMATION_SPECS = [
         pose_name="walk_right",
         duration=140,
         prompt=(
-            "walking in place while facing right, one foot forward, lively step-cycle pose, "
-            "full body visible"
+            "moving in place while facing right, species-accurate locomotion cycle: humanoids may "
+            "step naturally, land animals use a natural gait, and octopus or other marine/aquatic "
+            "creatures use a swimming posture; octopus or tentacled sea creatures use swimming-drift motion "
+            "with a suspended gliding body and tentacles rippling like soft ribbons, while other aquatic "
+            "creatures use fins, tail, tentacles, or body undulation, full body visible"
         ),
     ),
     AnimationSpec(
@@ -69,8 +73,11 @@ ANIMATION_SPECS = [
         pose_name="walk_left",
         duration=140,
         prompt=(
-            "walking in place while facing left, one foot forward, lively step-cycle pose, "
-            "full body visible"
+            "moving in place while facing left, species-accurate locomotion cycle: humanoids may "
+            "step naturally, land animals use a natural gait, and octopus or other marine/aquatic "
+            "creatures use a swimming posture; octopus or tentacled sea creatures use swimming-drift motion "
+            "with a suspended gliding body and tentacles rippling like soft ribbons, while other aquatic "
+            "creatures use fins, tail, tentacles, or body undulation, full body visible"
         ),
     ),
     AnimationSpec(
@@ -141,6 +148,12 @@ def animation_specs_for(names: Sequence[str] | None = None) -> list[AnimationSpe
         names = BASIC_DESKTOP_ANIMATION_NAMES
     requested = set(names)
     return [spec for spec in ANIMATION_SPECS if spec.name in requested]
+
+
+def _frame_sequence_generator_writes_full_video(
+    frame_sequence_generator: FrameSequenceGenerator | None,
+) -> bool:
+    return getattr(frame_sequence_generator, "__name__", "") == "_generate_wan_desktop_behavior_frames"
 
 
 def _static_url_to_path(image_url: str) -> Path:
@@ -317,7 +330,7 @@ def _frames_for_animation(name: str, pose: Image.Image) -> list[Image.Image]:
     return [_frame(pose) for _ in range(frame_count)]
 
 
-def _save_gif(path: Path, frames: list[Image.Image], duration: int = 160) -> None:
+def _save_gif(path: Path, frames: list[Image.Image], duration: int | list[int] = 160) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     paletted_frames = [_gif_frame(frame) for frame in frames]
     paletted_frames[0].save(
@@ -354,6 +367,46 @@ def _gif_frame(frame: Image.Image) -> Image.Image:
     return output
 
 
+def _gif_frame_count(path: Path) -> int:
+    with Image.open(path) as image:
+        return sum(1 for _ in ImageSequence.Iterator(image))
+
+
+def _gif_frames_and_durations(path: Path) -> tuple[list[Image.Image], list[int]]:
+    with Image.open(path) as image:
+        default_duration = int(image.info.get("duration", 160))
+        frames: list[Image.Image] = []
+        durations: list[int] = []
+        for frame in ImageSequence.Iterator(image):
+            frames.append(frame.copy().convert("RGBA"))
+            durations.append(int(frame.info.get("duration", default_duration)))
+    return frames, durations
+
+
+def _save_mirrored_gif(source_path: Path, output_path: Path) -> bool:
+    if not source_path.exists():
+        return False
+    frames, durations = _gif_frames_and_durations(source_path)
+    if not frames:
+        return False
+    _save_gif(output_path, [ImageOps.mirror(frame) for frame in frames], durations)
+    return True
+
+
+def _cache_busted_gif_src(gif_path: Path) -> tuple[str, str]:
+    stat = gif_path.stat()
+    version = f"{stat.st_mtime_ns:x}_{stat.st_size:x}"
+    versioned_path = gif_path.with_name(f"{gif_path.stem}_{version}{gif_path.suffix}")
+    if not versioned_path.exists():
+        shutil.copyfile(gif_path, versioned_path)
+    return versioned_path.name, version
+
+
+def _desktop_pet_manifest_url(character_id: str, asset_version: str | None = None) -> str:
+    url = f"/static/desktop_pet_assets/{character_id}/manifest.json"
+    return f"{url}?v={asset_version}" if asset_version else url
+
+
 def build_desktop_pet_assets(
     character: dict[str, Any],
     pose_image_generator: PoseImageGenerator | None = None,
@@ -375,10 +428,12 @@ def build_desktop_pet_assets(
     pose_sources: dict[str, dict[str, str]] = {
         "avatar": {"src": "avatar.png", "source": "confirmed_character"}
     }
+    asset_versions: list[str] = []
     generated_poses: dict[str, Image.Image] = {}
     generated_frames: dict[str, list[Image.Image]] = {}
 
     selected_specs = animation_specs_for(animation_names)
+    full_video_generator = _frame_sequence_generator_writes_full_video(frame_sequence_generator)
 
     def source_frames_for_spec(spec: AnimationSpec) -> tuple[list[Image.Image], str, Path]:
         pose_path = output_dir / f"{spec.pose_name}_pose.png"
@@ -432,7 +487,10 @@ def build_desktop_pet_assets(
                 or current_gif_stat.st_size != generated_gif_stat.st_size
             )
         )
-        if not generator_wrote_gif:
+        mirrored_full_video_gif = False
+        if spec.name == "walk_left" and full_video_generator:
+            mirrored_full_video_gif = _save_mirrored_gif(output_dir / "walk_right.gif", generated_gif_path)
+        if not generator_wrote_gif and not mirrored_full_video_gif:
             _save_gif(generated_gif_path, frames, spec.duration)
         animations[spec.name] = {
             "type": "gif",
@@ -440,6 +498,18 @@ def build_desktop_pet_assets(
             "pose": saved_pose.name,
             "frames": frame_names,
         }
+        if generator_wrote_gif and full_video_generator:
+            animations[spec.name]["source"] = "wan_full_video"
+            src, version = _cache_busted_gif_src(generated_gif_path)
+            animations[spec.name]["src"] = src
+            animations[spec.name]["cache_bust"] = version
+            asset_versions.append(version)
+        elif mirrored_full_video_gif:
+            animations[spec.name]["source"] = "wan_full_video_mirrored"
+            src, version = _cache_busted_gif_src(generated_gif_path)
+            animations[spec.name]["src"] = src
+            animations[spec.name]["cache_bust"] = version
+            asset_versions.append(version)
         pose_sources[spec.name] = {
             "src": saved_pose.name,
             "source": source_label,
@@ -463,12 +533,15 @@ def build_desktop_pet_assets(
         "animations": animations,
         "action_animation_map": action_animation_map,
     }
+    asset_version = max(asset_versions) if asset_versions else None
+    if asset_version:
+        manifest["asset_version"] = asset_version
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return {
-        "desktop_pet_manifest_url": f"/static/desktop_pet_assets/{character_id}/manifest.json",
+        "desktop_pet_manifest_url": _desktop_pet_manifest_url(character_id, asset_version),
         "desktop_pet_asset_dir": f"/static/desktop_pet_assets/{character_id}",
         "desktop_pet_avatar_url": f"/static/desktop_pet_assets/{character_id}/avatar.png",
     }
@@ -559,6 +632,7 @@ def publish_existing_behavior_assets(character: dict[str, Any]) -> dict[str, Any
     pose_sources: dict[str, dict[str, str]] = {
         "avatar": {"src": "avatar.png", "source": "confirmed_character"}
     }
+    asset_versions: list[str] = []
     action_animation_map: dict[str, str] = {"idle": "idle"}
 
     for spec in ANIMATION_SPECS:
@@ -571,7 +645,27 @@ def publish_existing_behavior_assets(character: dict[str, Any]) -> dict[str, Any
         existing_pose = output_dir / f"{spec.pose_name}_pose.png"
         frame_names: list[str] = []
 
-        if all(path.exists() for path in model_frames):
+        if spec.name == "walk_left":
+            walk_right_frames = [
+                output_dir / f"walk_right_model_frame_{index}.png"
+                for index in range(1, spec.frame_count + 1)
+            ]
+            if all(path.exists() for path in walk_right_frames):
+                frames = [ImageOps.mirror(_prepare_pose_image(path)) for path in walk_right_frames]
+                source_label = "mirrored_from_walk_right"
+            elif all(path.exists() for path in model_frames):
+                frames = [_prepare_pose_image(path) for path in model_frames]
+                source_label = "generated_behavior_frame_sequence"
+            elif model_sheet.exists():
+                frames = _frames_from_sheet(model_sheet, spec.frame_count)
+                source_label = "generated_behavior_frames"
+            elif model_pose.exists():
+                pose = _prepare_pose_image(model_pose)
+                frames = _frames_for_animation(spec.name, pose)
+                source_label = "generated_behavior_pose"
+            else:
+                continue
+        elif all(path.exists() for path in model_frames):
             frames = [_prepare_pose_image(path) for path in model_frames]
             source_label = "generated_behavior_frame_sequence"
         elif model_sheet.exists():
@@ -599,7 +693,22 @@ def publish_existing_behavior_assets(character: dict[str, Any]) -> dict[str, Any
             and source_label == "generated_behavior_frame_sequence"
             and gif_path.stat().st_mtime_ns >= max(path.stat().st_mtime_ns for path in model_frames)
         )
-        if not existing_gif_is_current:
+        right_model_frames = [
+            output_dir / f"walk_right_model_frame_{index}.png"
+            for index in range(1, spec.frame_count + 1)
+        ]
+        right_gif_path = output_dir / "walk_right.gif"
+        right_gif_is_current = (
+            spec.name == "walk_left"
+            and source_label == "mirrored_from_walk_right"
+            and right_gif_path.exists()
+            and all(path.exists() for path in right_model_frames)
+            and right_gif_path.stat().st_mtime_ns >= max(path.stat().st_mtime_ns for path in right_model_frames)
+        )
+        mirrored_full_video_gif = False
+        if right_gif_is_current and _gif_frame_count(right_gif_path) > len(frame_names):
+            mirrored_full_video_gif = _save_mirrored_gif(right_gif_path, gif_path)
+        if not existing_gif_is_current and not mirrored_full_video_gif:
             _save_gif(gif_path, frames, spec.duration)
         animations[spec.name] = {
             "type": "gif",
@@ -607,6 +716,18 @@ def publish_existing_behavior_assets(character: dict[str, Any]) -> dict[str, Any
             "pose": saved_pose.name,
             "frames": frame_names,
         }
+        if existing_gif_is_current and _gif_frame_count(gif_path) > len(frame_names):
+            animations[spec.name]["source"] = "wan_full_video"
+            src, version = _cache_busted_gif_src(gif_path)
+            animations[spec.name]["src"] = src
+            animations[spec.name]["cache_bust"] = version
+            asset_versions.append(version)
+        elif mirrored_full_video_gif:
+            animations[spec.name]["source"] = "wan_full_video_mirrored"
+            src, version = _cache_busted_gif_src(gif_path)
+            animations[spec.name]["src"] = src
+            animations[spec.name]["cache_bust"] = version
+            asset_versions.append(version)
         pose_sources[spec.name] = {
             "src": saved_pose.name,
             "source": source_label,
@@ -626,12 +747,15 @@ def publish_existing_behavior_assets(character: dict[str, Any]) -> dict[str, Any
         "animations": animations,
         "action_animation_map": action_animation_map,
     }
+    asset_version = max(asset_versions) if asset_versions else None
+    if asset_version:
+        manifest["asset_version"] = asset_version
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return {
-        "desktop_pet_manifest_url": f"/static/desktop_pet_assets/{character_id}/manifest.json",
+        "desktop_pet_manifest_url": _desktop_pet_manifest_url(character_id, asset_version),
         "desktop_pet_asset_dir": f"/static/desktop_pet_assets/{character_id}",
         "desktop_pet_avatar_url": f"/static/desktop_pet_assets/{character_id}/avatar.png",
         "published_animation_count": len(animations),

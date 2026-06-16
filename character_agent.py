@@ -116,12 +116,14 @@ Pose requirement:
 - Do not invent human legs, human feet, human arms, shoes, or hands for a creature that does not naturally have them.
 - If the character has humanoid arms, arms hang naturally downward and can swing slightly.
 - If the character is a four-legged animal, use a natural four-legged walking-ready pose.
-- If the character is an octopus, squid, slug, snail, or other soft-bodied mollusk, do not make it walk like a human or mammal:
-  make its arms/tentacles crawl or its soft body glide along the ground, with several arms/tentacles touching the ground as the moving base.
-- If the character is an octopus or tentacled creature, keep the tentacles and use tentacle-supported crawling/gliding locomotion:
-  several tentacles touch the ground as the moving base, with other tentacles slightly lifted for the next step.
-- If the character is a fish, use tail-fin swimming locomotion: the tail and tail fin swing side to side, the body gently undulates,
-  and no legs, feet, shoes, or walking stride are added.
+- If the character is an octopus, squid, fish, jellyfish, seahorse, dolphin, shrimp, crab, turtle, or other
+  marine or aquatic creature, use a swimming-ready pose instead of walking or crawling.
+- For marine/aquatic creatures, keep the body floating and use fins, tail, tentacles, or body undulation
+  as the movement cue; do not show ground contact, crawling, planted feet, or a walking stride.
+- If the character is an octopus, squid, or tentacled sea creature, use a swimming drift pose:
+  keep the body suspended and gliding through water while the arms/tentacles open, gather, and ripple
+  like soft ribbons, with some tentacles sweeping gently backward for propulsion.
+  Do not let tentacles stick to the ground or alternate like feet.
 - If the character is another animal or creature without arms, use its natural locomotion posture and do not add arms.
 - Preserve the same identity, colors, outfit, markings, face, species/creature traits, and proportions as much as possible.
 
@@ -282,8 +284,9 @@ Generate exactly one 2D pixel-art sprite pose for this desktop-pet behavior:
 
 Keep the same character identity, proportions, face, colors, markings, outfit, animal traits, and
 overall style. The pose must be physically different when the behavior requires it: sleeping should be
-a real sleeping/lying pose, walking should be a real walking/stepping pose, eating should include an
-eating posture, and relaxed/idle should look calm rather than like an action pose.
+a real sleeping/lying pose, walking should use species-accurate locomotion rather than a generic
+human step, eating should include an eating posture, and relaxed/idle should look calm rather than
+like an action pose.
 
 Character notes:
 {character.get("description", "")}
@@ -314,6 +317,32 @@ def _desktop_frame_prompt(character: dict, spec: Any, frame_index: int) -> str:
             f"In this frame, {detail}. "
             "Do not move the character's position on the canvas."
         )
+    elif spec.name in {"walk_right", "walk_left"}:
+        direction = "right" if spec.name == "walk_right" else "left"
+        walk_moments = {
+            1: (
+                "the floating body leans slightly into the swim direction while tentacles open like "
+                "soft ribbons, or fins, tail, and body segments begin a soft propulsion wave"
+            ),
+            2: "tentacles gather and sweep backward in swimming drift, or fins, tail, and body undulation push through water",
+            3: "the body follows the wave with a gentle floating bend while the canvas anchor stays fixed",
+            4: "the appendages drift back into a loop-ready swimming drift pose",
+        }
+        detail = walk_moments.get(frame_index, "show a clear loop-ready swimming locomotion pose")
+        frame_direction = (
+            f"\nWalking frame detail: face {direction} and use species-accurate locomotion. "
+            "If the pet is humanoid, use a natural in-place step. If the pet is a four-legged animal, "
+            "use a natural four-legged gait. If the pet is an octopus, squid, fish, jellyfish, seahorse, "
+            "dolphin, shrimp, crab, turtle, or other marine/aquatic creature, do not add human legs, feet, "
+            "shoes, or human hands: keep the body in a swimming posture with a floating body. In this frame, "
+            f"{detail}. "
+            "For octopus, squid, or tentacled sea pets, the movement must read as swimming drift: "
+            "the body stays suspended and glides while tentacles open, gather, and ripple like soft ribbons. "
+            "For other aquatic pets, the movement should read as swimming through water: tentacles, fins, tail, "
+            "or body undulation create propulsion while the character stays centered in the sprite frame. "
+            "Do not show ground contact, crawling, planted feet, or suction-cup floor contact. "
+            "Keep the character's visual anchor fixed on the canvas."
+        )
 
     return f"""
 Use the uploaded confirmed desktop pet character as a locked identity reference.
@@ -328,18 +357,18 @@ pet's age.
 
 Animation requirements:
 - This is one complete frame in a {spec.frame_count}-frame action sequence.
-- Show the frame-specific moment for frame {frame_index}: keep scale, foot/base anchor, and character
+- Show the frame-specific moment for frame {frame_index}: keep scale, visual/base anchor, and character
   size consistent with the other frames.
 - The desktop host app moves the Swift window across the screen. Do not simulate travel by shifting
   the pet left or right inside the PNG frames.
-- Keep the pet's center point and bottom contact/visual anchor fixed in the same canvas position for
-  every frame. Walking frames must be an in-place stepping loop, not a traveling sprite.
+- Keep the pet's center point and bottom/visual anchor fixed in the same canvas position for
+  every frame. Walking frames must be an in-place movement loop, not a traveling sprite.
 - Do not create a sprite sheet, strip, collage, grid, multiple frames, or multiple copies.
 - For idle/relax, use a small breathing or posture variation.
 - For idle specifically, use four frames total: all frames are seated; frame 1 tilts the upper body
   gently left, frame 2 transitions back toward center, frame 3 tilts the upper body gently right,
   frame 4 transitions back toward center, and the seated base anchor stays fixed.
-- For walking, use a readable in-place stepping-cycle pose for this frame.
+- For walking, use a readable species-accurate locomotion pose for this frame.
 - For happy/play/feed/refill/pet/clean/lullaby/work/alert/sleep, make this frame's behavior readable
   through body pose and expression while staying consistent with the other frames.
 
@@ -419,6 +448,7 @@ def _generate_wan_desktop_behavior_frames(character: dict, spec: Any, output_dir
             output_dir=output_dir,
             frame_count=spec.frame_count,
             duration_ms=spec.duration,
+            target_duration_ms=int(os.getenv("WAN_GIF_DURATION_MS", "5000")),
         )
     except ValueError as exc:
         raise ValueError(f"Wan 图生视频生成 {spec.name} 动作 GIF 失败：{exc}") from exc

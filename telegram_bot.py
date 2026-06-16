@@ -7,8 +7,13 @@ Slash commands are kept only as debug/bootstrap fallbacks.
 
 import os
 import json
+import random
+import re
 import threading
 import time
+import unicodedata
+from difflib import SequenceMatcher
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,11 +22,40 @@ from dotenv import load_dotenv
 
 from diagnostics import log_event, log_exception, new_trace_id
 from desktop_pet_assets import BASIC_DESKTOP_ANIMATION_NAMES
+from pet_message_agent import format_speaker_labeled_message
 from pet_runtime_controller import controller_from_env
 from pet_status_service import format_action_reply, format_pet_status
 
 
 load_dotenv()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -33,6 +67,32 @@ ALLOWED_OWNER_CHAT_IDS = {
 API_BASE_URL = os.getenv("PET_AGENT_API_URL", "http://127.0.0.1:8000")
 DEFAULT_PET_ID = os.getenv("PET_AGENT_DEFAULT_PET_ID", "")
 PROJECT_ROOT = Path(__file__).resolve().parent
+PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS = int(
+    os.getenv("PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS", "3600")
+)
+PET_FRIEND_DAILY_MESSAGE_COOLDOWN_SECONDS = int(
+    os.getenv("PET_FRIEND_DAILY_MESSAGE_COOLDOWN_SECONDS", "86400")
+)
+PET_FRIEND_DAILY_MESSAGE_CHANCE = float(os.getenv("PET_FRIEND_DAILY_MESSAGE_CHANCE", "0.15"))
+PET_FRIEND_DAILY_MESSAGE_MAX_PER_SCAN = int(
+    os.getenv("PET_FRIEND_DAILY_MESSAGE_MAX_PER_SCAN", "1")
+)
+PET_FRIEND_MEMORY_SHARE_SUGGESTION_COOLDOWN_SECONDS = int(
+    os.getenv("PET_FRIEND_MEMORY_SHARE_SUGGESTION_COOLDOWN_SECONDS", "21600")
+)
+PET_FRIEND_MEMORY_SHARE_SUGGESTION_CHANCE = float(
+    os.getenv("PET_FRIEND_MEMORY_SHARE_SUGGESTION_CHANCE", "0.25")
+)
+ASSISTANT_DUE_SCAN_INTERVAL_SECONDS = int(
+    os.getenv("PET_AGENT_ASSISTANT_DUE_SCAN_INTERVAL_SECONDS", "30")
+)
+PROACTIVE_TICKS_ENABLED = _env_bool("PET_AGENT_PROACTIVE_TICKS_ENABLED", True)
+PROACTIVE_TICK_INTERVAL_SECONDS = _env_float(
+    "PET_AGENT_PROACTIVE_TICK_INTERVAL_SECONDS",
+    600,
+)
+PROACTIVE_TICK_MINUTES = _env_int("PET_AGENT_PROACTIVE_TICK_MINUTES", 10)
+PROACTIVE_TICK_HTTP_TIMEOUT_SECONDS = 20
 
 AVATAR_PREVIEW_PROGRESS_STAGES = [
     "收到设定，正在整理宠物形象线索",
@@ -60,6 +120,7 @@ AVATAR_ASSET_ANIMATION_LABELS = {
     "happy": "开心",
 }
 STICKER_PACK_SIZE = 12
+MEMORY_PHOTO_PENDING_TTL_SECONDS = 30 * 60
 PET_SPECIES_LABELS = {
     "cat": "猫",
     "dog": "狗",
@@ -86,9 +147,16 @@ PENDING_AVATAR_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_PET_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_RELATIONSHIP_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_FRIENDSHIP_INVITE_FLOWS: dict[str, dict[str, Any]] = {}
+PENDING_FRIEND_MEMORY_SHARE_FLOWS: dict[str, dict[str, Any]] = {}
 PENDING_MEMORY_PHOTO_FLOWS: dict[str, dict[str, Any]] = {}
 CURRENT_PET_IDS: dict[str, int] = {}
 OWNER_IDS_BY_CHAT: dict[str, int] = {}
+OWNER_DISPLAY_NAMES_BY_CHAT: dict[str, str] = {}
+FRIENDSHIP_DAILY_MESSAGE_LAST_SENT: dict[int, float] = {}
+FRIENDSHIP_DAILY_MESSAGE_SCAN_LAST = 0.0
+MEMORY_SHARE_SUGGESTION_LAST_BY_CHAT: dict[str, float] = {}
+ASSISTANT_DUE_SCAN_LAST = 0.0
+ASSISTANT_ACTIVE_CHATS: set[str] = set()
 ACTIVE_PET_GROUP_CHATS: set[str] = set()
 PET_GROUP_LAST_SPEAKER_IDS: dict[str, list[int]] = {}
 ACTIVE_AVATAR_GENERATIONS: dict[str, object] = {}
@@ -137,8 +205,8 @@ MAIN_REPLY_KEYBOARD = {
     "keyboard": [
         [{"text": "查看状态"}, {"text": "桌面陪伴"}],
         [{"text": "宠物列表"}, {"text": "宠物关系"}],
-        [{"text": "宠物好友"}],
-        [{"text": "创建宠物"}],
+        [{"text": "宠物好友"}, {"text": "宠物记忆"}],
+        [{"text": "创建宠物"}, {"text": "小助手"}],
         [{"text": "喂饭"}, {"text": "加水"}, {"text": "陪玩"}],
         [{"text": "摸摸"}, {"text": "清洁"}, {"text": "哄睡"}],
     ],
@@ -203,20 +271,29 @@ def is_chat_allowed(chat_id: str) -> bool:
     return True
 
 
-def ensure_owner_id(chat_id: str) -> Optional[int]:
+def ensure_owner_id(chat_id: str, display_name: str = "") -> Optional[int]:
     if not owner_scoping_enabled():
         return None
-    if chat_id in OWNER_IDS_BY_CHAT:
+    clean_name = str(display_name or "").strip()
+    if chat_id in OWNER_IDS_BY_CHAT and not clean_name:
+        return OWNER_IDS_BY_CHAT[chat_id]
+    if (
+        chat_id in OWNER_IDS_BY_CHAT
+        and clean_name
+        and OWNER_DISPLAY_NAMES_BY_CHAT.get(chat_id) == clean_name
+    ):
         return OWNER_IDS_BY_CHAT[chat_id]
     response = requests.post(
         f"{API_BASE_URL}/owners/telegram",
-        json={"telegram_chat_id": chat_id, "display_name": ""},
+        json={"telegram_chat_id": chat_id, "display_name": clean_name},
         timeout=10,
     )
     if response.status_code >= 400:
         raise RuntimeError(response.text)
     owner_id = int(response.json()["id"])
     OWNER_IDS_BY_CHAT[chat_id] = owner_id
+    if clean_name:
+        OWNER_DISPLAY_NAMES_BY_CHAT[chat_id] = clean_name
     return owner_id
 
 
@@ -228,8 +305,29 @@ def owner_params(chat_id: str) -> dict[str, int]:
 def owner_params_kwarg(chat_id: Optional[str]) -> dict[str, dict[str, int]]:
     if chat_id is None:
         return {}
-    params = owner_params(chat_id)
+    params = dict(owner_params(chat_id))
     return {"params": params} if params else {}
+
+
+def owner_display_name_from_user(user: Optional[dict[str, Any]]) -> str:
+    if not user:
+        return ""
+    parts = [
+        str(user.get("first_name") or "").strip(),
+        str(user.get("last_name") or "").strip(),
+    ]
+    full_name = " ".join(part for part in parts if part).strip()
+    return full_name or str(user.get("username") or "").strip()
+
+
+def remember_owner_display_name(chat_id: str, user: Optional[dict[str, Any]]) -> None:
+    display_name = owner_display_name_from_user(user)
+    if not display_name or not owner_scoping_enabled():
+        return
+    try:
+        ensure_owner_id(chat_id, display_name=display_name)
+    except (RuntimeError, requests.RequestException) as exc:
+        log_exception("telegram_owner_display_name_update_failed", None, exc, chat_id=chat_id)
 
 
 def api_get_pets(chat_id: str) -> list[dict[str, Any]]:
@@ -257,6 +355,114 @@ def send_message(
         "sendMessage",
         payload,
     )
+
+
+def _friendship_contacts_for_chat(
+    chat_id: str,
+    *,
+    pet_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    owner_id = ensure_owner_id(chat_id)
+    if owner_id is None:
+        return []
+    params: dict[str, int] = {"owner_id": owner_id}
+    if pet_id is not None:
+        params["pet_id"] = int(pet_id)
+    response = requests.get(
+        f"{API_BASE_URL}/pet-friendships",
+        params=params,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+
+    contacts: list[dict[str, Any]] = []
+    for friendship in response.json():
+        try:
+            if bool(friendship.get("muted")):
+                continue
+            owner_a_id = int(friendship.get("owner_a_id"))
+            owner_b_id = int(friendship.get("owner_b_id"))
+            if owner_a_id == int(owner_id):
+                local_side = "a"
+                friend_side = "b"
+            elif owner_b_id == int(owner_id):
+                local_side = "b"
+                friend_side = "a"
+            else:
+                continue
+            friend_chat_id = str(friendship.get(f"owner_{friend_side}_chat_id") or "").strip()
+            if not friend_chat_id:
+                continue
+            contacts.append(
+                {
+                    "friendship_id": int(friendship["id"]),
+                    "affinity": int(friendship.get("affinity") or 0),
+                    "local_pet_id": int(friendship[f"pet_{local_side}_id"]),
+                    "local_pet_name": str(friendship.get(f"pet_{local_side}_name") or "我家宠物"),
+                    "local_owner_id": int(friendship[f"owner_{local_side}_id"]),
+                    "local_owner_name": str(friendship.get(f"owner_{local_side}_name") or ""),
+                    "local_owner_chat_id": str(friendship.get(f"owner_{local_side}_chat_id") or chat_id),
+                    "friend_pet_id": int(friendship[f"pet_{friend_side}_id"]),
+                    "friend_pet_name": str(friendship.get(f"pet_{friend_side}_name") or "好友宠物"),
+                    "friend_owner_id": int(friendship[f"owner_{friend_side}_id"]),
+                    "friend_owner_name": str(friendship.get(f"owner_{friend_side}_name") or ""),
+                    "friend_owner_chat_id": friend_chat_id,
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    contacts.sort(key=lambda item: (-int(item.get("affinity") or 0), item["friendship_id"]))
+    return contacts
+
+
+def _contact_label(contact: dict[str, Any]) -> str:
+    return (
+        str(contact.get("friend_owner_name") or "").strip()
+        or str(contact.get("friend_pet_name") or "").strip()
+        or str(contact.get("friend_owner_chat_id") or "").strip()
+        or "好友"
+    )
+
+
+def _find_friendship_contact(
+    chat_id: str,
+    target: str,
+    *,
+    pet_id: Optional[int] = None,
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    contacts = _friendship_contacts_for_chat(chat_id, pet_id=pet_id)
+    needle = target.strip().casefold()
+    if not needle:
+        return None, contacts
+
+    exact: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
+    for contact in contacts:
+        aliases = [
+            str(contact.get("friend_owner_name") or ""),
+            str(contact.get("friend_pet_name") or ""),
+            str(contact.get("friend_owner_chat_id") or ""),
+        ]
+        normalized = [alias.strip().casefold() for alias in aliases if alias.strip()]
+        if needle in normalized:
+            exact.append(contact)
+        elif any(needle in alias for alias in normalized):
+            partial.append(contact)
+    if len(exact) == 1:
+        return exact[0], contacts
+    if len(exact) > 1:
+        return None, contacts
+    if len(partial) == 1:
+        return partial[0], contacts
+    return None, contacts
+
+
+def _friend_contact_help(contacts: list[dict[str, Any]]) -> str:
+    if not contacts:
+        return "当前宠物还没有可发送消息的好友。先通过「宠物好友」建立好友关系。"
+    names = "、".join(_contact_label(contact) for contact in contacts[:6])
+    return f"我没找到这个好友。现在可以指定：{names}"
 
 
 def remove_reply_keyboard(chat_id: str, text: str = "正在刷新底部键盘。") -> dict[str, Any]:
@@ -504,8 +710,110 @@ def configure_bot_ui() -> None:
         telegram_api("deleteMyCommands")
     except RuntimeError as exc:
         log_exception("telegram_command_cleanup_failed", None, exc)
+    target_chat_ids = []
     if ALLOWED_CHAT_ID:
-        send_main_menu(ALLOWED_CHAT_ID)
+        target_chat_ids.append(ALLOWED_CHAT_ID)
+    target_chat_ids.extend(sorted(ALLOWED_OWNER_CHAT_IDS))
+    for chat_id in dict.fromkeys(target_chat_ids):
+        try:
+            send_main_menu(chat_id)
+        except RuntimeError as exc:
+            log_exception("telegram_menu_refresh_failed", None, exc, chat_id=chat_id)
+
+
+def proactive_target_chat_ids() -> list[str]:
+    """Return Telegram chats that may receive pet-initiated updates."""
+    target_chat_ids: list[str] = []
+    if ALLOWED_CHAT_ID:
+        target_chat_ids.append(ALLOWED_CHAT_ID)
+    target_chat_ids.extend(sorted(ALLOWED_OWNER_CHAT_IDS))
+    target_chat_ids.extend(list(CURRENT_PET_IDS.keys()))
+    return list(dict.fromkeys(chat_id for chat_id in target_chat_ids if chat_id))
+
+
+def _generated_tick_message(result: dict[str, Any], pet: Optional[dict[str, Any]] = None) -> str:
+    event_result = result.get("event_result") or {}
+    message = event_result.get("message") or {}
+    text = str(message.get("message") or "").strip()
+    pet_name = str(
+        event_result.get("pet_name")
+        or message.get("pet_name")
+        or (pet or {}).get("name")
+        or ""
+    ).strip()
+    return format_speaker_labeled_message(text, pet_name).strip()
+
+
+def _tick_virtual_pet_for_chat(
+    chat_id: str,
+    pet: dict[str, Any],
+    tick_minutes: int,
+) -> Optional[str]:
+    params = dict(owner_params(chat_id))
+    params["notify"] = "false"
+    response = requests.post(
+        f"{API_BASE_URL}/virtual-pets/{int(pet['id'])}/tick",
+        params=params,
+        json={"minutes": tick_minutes},
+        timeout=PROACTIVE_TICK_HTTP_TIMEOUT_SECONDS,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    return _generated_tick_message(response.json(), pet) or None
+
+
+def proactive_tick_chat(chat_id: str, tick_minutes: int = PROACTIVE_TICK_MINUTES) -> dict[str, int]:
+    """Advance all virtual pets for one chat and send generated event messages."""
+    counts = {"pets": 0, "messages": 0}
+    pets = [pet for pet in api_get_pets(chat_id) if pet.get("pet_mode") == "virtual"]
+    for pet in pets:
+        counts["pets"] += 1
+        message = _tick_virtual_pet_for_chat(chat_id, pet, tick_minutes)
+        if not message:
+            continue
+        send_message(chat_id, message, reply_markup=MAIN_REPLY_KEYBOARD)
+        counts["messages"] += 1
+        log_event(
+            "proactive_virtual_pet_message_sent",
+            None,
+            chat_id=chat_id,
+            pet_id=pet.get("id"),
+        )
+    return counts
+
+
+def proactive_tick_virtual_pets_once(
+    tick_minutes: int = PROACTIVE_TICK_MINUTES,
+) -> dict[str, int]:
+    """Run one proactive virtual-pet tick pass for configured Telegram chats."""
+    totals = {"chats": 0, "pets": 0, "messages": 0}
+    for chat_id in proactive_target_chat_ids():
+        totals["chats"] += 1
+        try:
+            counts = proactive_tick_chat(chat_id, tick_minutes=tick_minutes)
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            log_exception("proactive_virtual_pet_tick_failed", None, exc, chat_id=chat_id)
+            continue
+        totals["pets"] += counts["pets"]
+        totals["messages"] += counts["messages"]
+    return totals
+
+
+def start_proactive_tick_loop(
+    interval_seconds: float = PROACTIVE_TICK_INTERVAL_SECONDS,
+    tick_minutes: int = PROACTIVE_TICK_MINUTES,
+) -> threading.Event:
+    """Start the background loop that lets virtual pets initiate Telegram updates."""
+    stop_event = threading.Event()
+    interval_seconds = max(1.0, interval_seconds)
+    tick_minutes = max(1, min(24 * 60, int(tick_minutes)))
+
+    def _run() -> None:
+        while not stop_event.wait(interval_seconds):
+            proactive_tick_virtual_pets_once(tick_minutes=tick_minutes)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return stop_event
 
 
 def get_default_pet_id() -> int:
@@ -612,6 +920,314 @@ def send_settings_menu(chat_id: str) -> None:
         return
     except (RuntimeError, requests.RequestException):
         send_message(chat_id, "请先到「宠物列表」选择一只宠物再设置资料。", reply_markup=MAIN_REPLY_KEYBOARD)
+
+
+ASSISTANT_HELP_TEXT = (
+    "小助手现在会这几件简单事：\n"
+    "记一下 明天改登录页文案\n"
+    "待办 写周报\n"
+    "我的待办 / 我的记事\n"
+    "完成 7\n"
+    "提醒 10分钟后 喝水\n"
+    "闹钟 16:30 开会\n"
+    "番茄钟 25 写 PR 描述"
+)
+
+
+def _assistant_now(now: Optional[datetime] = None) -> datetime:
+    value = now or datetime.now().astimezone()
+    return value.replace(microsecond=0)
+
+
+def _strip_assistant_prefix(text: str) -> str:
+    value = str(text or "").strip()
+    for prefix in ("小助手", "龙虾"):
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip(" ，,:：")
+    return value
+
+
+def _assistant_item_payload(
+    item_type: str,
+    title: str,
+    body: str = "",
+    due_at: Optional[datetime] = None,
+    duration_minutes: Optional[int] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "item_type": item_type,
+        "title": title.strip(),
+        "body": body.strip(),
+        "source": "telegram",
+    }
+    if due_at is not None:
+        payload["due_at"] = due_at.replace(microsecond=0).isoformat()
+    if duration_minutes is not None:
+        payload["duration_minutes"] = int(duration_minutes)
+    return payload
+
+
+def _parse_relative_due(text: str, now: datetime) -> Optional[tuple[datetime, str, int]]:
+    match = re.match(r"^(?P<amount>\d{1,4})\s*(?P<unit>分钟|分|小时|时)后\s*(?P<title>.+)$", text)
+    if not match:
+        return None
+    amount = int(match.group("amount"))
+    unit = match.group("unit")
+    minutes = amount * 60 if unit in {"小时", "时"} else amount
+    if minutes <= 0:
+        return None
+    return now + timedelta(minutes=minutes), match.group("title").strip(), minutes
+
+
+def _parse_clock_due(text: str, now: datetime) -> Optional[tuple[datetime, str]]:
+    match = re.match(r"^(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<title>.*)$", text)
+    if not match:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if hour > 23 or minute > 59:
+        return None
+    due_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if due_at <= now:
+        due_at += timedelta(days=1)
+    title = match.group("title").strip() or "提醒一下"
+    return due_at, title
+
+
+def parse_assistant_command(text: str, now: Optional[datetime] = None) -> Optional[dict[str, Any]]:
+    """Parse a small Telegram helper command into an assistant item payload."""
+    value = _strip_assistant_prefix(text)
+    if not value or value in {"小助手", "助手"}:
+        return None
+    current_time = _assistant_now(now)
+
+    for prefix in ("记一下", "记事", "备忘"):
+        if value.startswith(prefix):
+            title = value[len(prefix) :].strip(" ，,:：")
+            return _assistant_item_payload("note", title) if title else None
+
+    for prefix in ("待办", "todo", "TODO"):
+        if value.startswith(prefix):
+            title = value[len(prefix) :].strip(" ，,:：")
+            return _assistant_item_payload("todo", title) if title else None
+
+    for prefix in ("提醒", "闹钟"):
+        if value.startswith(prefix):
+            body = value[len(prefix) :].strip(" ，,:：")
+            relative = _parse_relative_due(body, current_time)
+            if relative:
+                due_at, title, _minutes = relative
+                return _assistant_item_payload("alarm", title, due_at=due_at)
+            clock = _parse_clock_due(body, current_time)
+            if clock:
+                due_at, title = clock
+                return _assistant_item_payload("alarm", title, due_at=due_at)
+            return None
+
+    for prefix in ("番茄钟", "专注"):
+        if value.startswith(prefix):
+            body = value[len(prefix) :].strip(" ，,:：")
+            match = re.match(r"^(?:(?P<minutes>\d{1,4})\s*(?:分钟|分|min)?\s*)?(?P<title>.*)$", body)
+            minutes = int(match.group("minutes") or 25) if match else 25
+            if minutes <= 0:
+                return None
+            title = (match.group("title") if match else "").strip() or "专注一下"
+            return _assistant_item_payload(
+                "focus",
+                title,
+                due_at=current_time + timedelta(minutes=minutes),
+                duration_minutes=minutes,
+            )
+
+    return None
+
+
+def _assistant_created_reply(item: dict[str, Any]) -> str:
+    item_type = item.get("item_type")
+    title = str(item.get("title") or "这件事")
+    item_id = item.get("id")
+    if item_type == "note":
+        return f"记下啦：{title}\n编号：{item_id}"
+    if item_type == "todo":
+        return f"待办加好啦：{title}\n编号：{item_id}"
+    if item_type == "focus":
+        return f"好，我陪你专注：{title}\n到点我会叫你。编号：{item_id}"
+    return f"闹钟设好啦：{title}\n到点我会叫你。编号：{item_id}"
+
+
+def _assistant_item_list_title(item_type: str) -> str:
+    return {
+        "note": "记事本",
+        "todo": "待办",
+        "alarm": "提醒",
+        "focus": "番茄钟",
+    }.get(item_type, "小助手事项")
+
+
+def _assistant_item_line(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "未命名")
+    due_at = str(item.get("due_at") or "").strip()
+    suffix = f"（{due_at}）" if due_at else ""
+    return f"#{item.get('id')} {title}{suffix}"
+
+
+def send_assistant_item_list(chat_id: str, item_type: str) -> None:
+    params = dict(owner_params(chat_id))
+    params.update({"item_type": item_type, "status": "open", "limit": 10})
+    response = requests.get(
+        f"{API_BASE_URL}/assistant/items",
+        params=params,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        send_message(chat_id, f"读取小助手列表失败：{response.text}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    items = response.json()
+    title = _assistant_item_list_title(item_type)
+    if not items:
+        send_message(chat_id, f"{title}现在是空的。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+    lines = [f"{title}：", *[_assistant_item_line(item) for item in items]]
+    send_message(chat_id, "\n".join(lines), reply_markup=MAIN_REPLY_KEYBOARD)
+
+
+def complete_assistant_item_from_text(chat_id: str, text: str) -> bool:
+    match = re.match(r"^(?:完成|完成待办)\s*#?(?P<item_id>\d+)$", text.strip())
+    if not match:
+        return False
+    payload = dict(owner_params(chat_id))
+    payload["status"] = "done"
+    item_id = int(match.group("item_id"))
+    response = requests.patch(
+        f"{API_BASE_URL}/assistant/items/{item_id}/complete",
+        json=payload,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        send_message(chat_id, f"完成失败：{response.text}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    item = response.json()
+    send_message(
+        chat_id,
+        f"完成啦：{item.get('title') or f'#{item_id}'}",
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+    return True
+
+
+def handle_assistant_text(chat_id: str, text: str) -> bool:
+    if text.strip() in {"小助手", "助手"}:
+        ASSISTANT_ACTIVE_CHATS.add(chat_id)
+        send_message(chat_id, ASSISTANT_HELP_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    if text.strip() in {"我的待办", "待办列表"}:
+        ASSISTANT_ACTIVE_CHATS.add(chat_id)
+        send_assistant_item_list(chat_id, "todo")
+        return True
+    if text.strip() in {"我的记事", "记事本"}:
+        ASSISTANT_ACTIVE_CHATS.add(chat_id)
+        send_assistant_item_list(chat_id, "note")
+        return True
+    if text.strip() in {"提醒列表", "闹钟列表"}:
+        ASSISTANT_ACTIVE_CHATS.add(chat_id)
+        send_assistant_item_list(chat_id, "alarm")
+        return True
+    if text.strip() in {"番茄钟列表", "专注列表"}:
+        ASSISTANT_ACTIVE_CHATS.add(chat_id)
+        send_assistant_item_list(chat_id, "focus")
+        return True
+    if complete_assistant_item_from_text(chat_id, text):
+        ASSISTANT_ACTIVE_CHATS.add(chat_id)
+        return True
+
+    payload = parse_assistant_command(text)
+    if payload is None:
+        return False
+    ASSISTANT_ACTIVE_CHATS.add(chat_id)
+    payload.update(owner_params(chat_id))
+    response = requests.post(
+        f"{API_BASE_URL}/assistant/items",
+        json=payload,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        send_message(chat_id, f"小助手保存失败：{response.text}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    send_message(
+        chat_id,
+        _assistant_created_reply(response.json()),
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+    return True
+
+
+def _assistant_due_reply(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "这件事")
+    if item.get("item_type") == "focus":
+        return f"番茄钟到点啦：{title}\n先停一下，喝口水，眼睛也休息一下。"
+    return f"提醒时间到啦：{title}"
+
+
+def send_due_assistant_items_for_chat(
+    chat_id: str,
+    now: Optional[datetime] = None,
+) -> int:
+    params = dict(owner_params(chat_id))
+    params.update(
+        {
+            "status": "open",
+            "due_before": _assistant_now(now).isoformat(),
+            "limit": 20,
+        }
+    )
+    response = requests.get(
+        f"{API_BASE_URL}/assistant/items",
+        params=params,
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    sent_count = 0
+    for item in response.json():
+        if item.get("item_type") not in {"alarm", "focus"}:
+            continue
+        send_message(chat_id, _assistant_due_reply(item), reply_markup=MAIN_REPLY_KEYBOARD)
+        sent_count += 1
+        complete_payload = dict(owner_params(chat_id))
+        complete_payload["status"] = "dismissed"
+        complete_response = requests.patch(
+            f"{API_BASE_URL}/assistant/items/{int(item['id'])}/complete",
+            json=complete_payload,
+            timeout=10,
+        )
+        if complete_response.status_code >= 400:
+            log_exception(
+                "assistant_due_item_dismiss_failed",
+                None,
+                RuntimeError(complete_response.text),
+                chat_id=chat_id,
+                item_id=item.get("id"),
+            )
+    return sent_count
+
+
+def maybe_send_due_assistant_items(now: Optional[datetime] = None, force: bool = False) -> int:
+    global ASSISTANT_DUE_SCAN_LAST
+    current_time = time.monotonic()
+    if (
+        not force
+        and current_time - ASSISTANT_DUE_SCAN_LAST < ASSISTANT_DUE_SCAN_INTERVAL_SECONDS
+    ):
+        return 0
+    ASSISTANT_DUE_SCAN_LAST = current_time
+    sent_count = 0
+    target_chat_ids = list(dict.fromkeys([*proactive_target_chat_ids(), *ASSISTANT_ACTIVE_CHATS]))
+    for chat_id in target_chat_ids:
+        try:
+            sent_count += send_due_assistant_items_for_chat(chat_id, now=now)
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            log_exception("assistant_due_scan_failed", None, exc, chat_id=chat_id)
+    return sent_count
 
 
 def handle_status_command(chat_id: str) -> None:
@@ -1103,6 +1719,242 @@ def accept_friendship_invite_for_pet(chat_id: str, token: str, pet_id: int) -> N
     )
 
 
+def _parse_friend_owner_share(text: str) -> Optional[dict[str, str]]:
+    match = re.match(
+        r"^分享给\s*(?P<target>[^：:，,\s]+)\s*(?P<sep>[：:，,\s])\s*(?P<content>.+)$",
+        text.strip(),
+    )
+    if not match:
+        return None
+    return {
+        "target": match.group("target").strip(),
+        "content": match.group("content").strip(),
+    }
+
+
+def handle_friend_owner_share_text(chat_id: str, text: str) -> bool:
+    parsed = _parse_friend_owner_share(text)
+    if parsed is None:
+        if text.strip().startswith("分享给"):
+            send_message(
+                chat_id,
+                "要分享给哪位好友主人？可以发：分享给小红：今天黑米学会了握手",
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+            return True
+        return False
+    if ensure_owner_id(chat_id) is None:
+        send_message(chat_id, "跨主人分享需要先启用多主人 allowlist。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    try:
+        pet = get_current_pet(chat_id)
+        contact, contacts = _find_friendship_contact(
+            chat_id,
+            parsed["target"],
+            pet_id=int(pet["id"]),
+        )
+        if contact is None:
+            send_message(chat_id, _friend_contact_help(contacts), reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        target_label = _contact_label(contact)
+        send_message(
+            str(contact["friend_owner_chat_id"]),
+            (
+                f"{pet['name']} 托我带来一条分享：\n"
+                f"{parsed['content']}\n\n"
+                f"来自好友宠物 {pet['name']}。"
+            ),
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        send_message(chat_id, f"已分享给{target_label}。", reply_markup=MAIN_REPLY_KEYBOARD)
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        send_message(chat_id, f"分享失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+    return True
+
+
+def _parse_friend_memory_share(text: str) -> Optional[dict[str, Any]]:
+    match = re.match(
+        r"^分享记忆\s*#?(?P<memory_id>\d+)\s*给\s*(?P<target>.+)$",
+        text.strip(),
+    )
+    if not match:
+        return None
+    return {
+        "memory_id": int(match.group("memory_id")),
+        "target": match.group("target").strip(" ：:，,"),
+    }
+
+
+def _memory_for_friend_share(chat_id: str, memory_id: int) -> Optional[dict[str, Any]]:
+    owned_pet_ids = set(_all_pet_ids_for_memory(chat_id))
+    response = requests.get(
+        f"{API_BASE_URL}/pet-memories",
+        params={
+            **owner_params(chat_id),
+            "limit": 100,
+            "visibility": "home",
+        },
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    for memory in response.json():
+        participant_ids = {
+            int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+        }
+        if int(memory.get("id")) == int(memory_id) and owned_pet_ids.intersection(participant_ids):
+            return memory
+    return None
+
+
+def start_friend_memory_share_confirmation(chat_id: str, text: str) -> bool:
+    parsed = _parse_friend_memory_share(text)
+    if parsed is None:
+        return False
+    if ensure_owner_id(chat_id) is None:
+        send_message(chat_id, "记忆分享给好友需要先启用多主人 allowlist。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    try:
+        pet = get_current_pet(chat_id)
+        memory = _memory_for_friend_share(chat_id, int(parsed["memory_id"]))
+        if memory is None:
+            send_message(chat_id, "找不到这条记忆，或它不属于当前聊天。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        contact, contacts = _find_friendship_contact(
+            chat_id,
+            str(parsed["target"]),
+            pet_id=int(pet["id"]),
+        )
+        if contact is None:
+            send_message(chat_id, _friend_contact_help(contacts), reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        send_message(chat_id, f"准备分享记忆失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+
+    PENDING_FRIEND_MEMORY_SHARE_FLOWS[chat_id] = {
+        "memory": memory,
+        "contact": contact,
+        "pet": pet,
+    }
+    content = str(memory.get("content") or "").replace("\n", " ")
+    if len(content) > 80:
+        content = f"{content[:80]}..."
+    send_message(
+        chat_id,
+        (
+            f"要把这条记忆分享给{_contact_label(contact)}吗？\n"
+            f"#{memory.get('id')} {memory.get('title') or '记忆'}：{content}\n\n"
+            "回复“确认分享”发送，回复“取消分享”取消。"
+        ),
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+    return True
+
+
+def handle_friend_memory_share_confirmation_text(chat_id: str, text: str) -> bool:
+    flow = PENDING_FRIEND_MEMORY_SHARE_FLOWS.get(chat_id)
+    if not flow:
+        return False
+    value = text.strip()
+    if value in {"取消分享", "取消"}:
+        PENDING_FRIEND_MEMORY_SHARE_FLOWS.pop(chat_id, None)
+        send_message(chat_id, "已取消这次记忆分享。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+    if value not in {"确认分享", "确认", "发送"}:
+        return False
+
+    memory = flow["memory"]
+    contact = flow["contact"]
+    pet = flow["pet"]
+    send_message(
+        str(contact["friend_owner_chat_id"]),
+        (
+            f"{pet['name']} 想把一条主人同意分享的记忆告诉"
+            f"{contact['friend_pet_name']}：\n"
+            f"{memory.get('content') or ''}\n\n"
+            f"记忆：#{memory.get('id')} {memory.get('title') or '未命名'}"
+        ),
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+    PENDING_FRIEND_MEMORY_SHARE_FLOWS.pop(chat_id, None)
+    send_message(chat_id, "已分享这条记忆。", reply_markup=MAIN_REPLY_KEYBOARD)
+    return True
+
+
+def _memory_share_suggestion_text(chat_id: str, memory: dict[str, Any]) -> str:
+    memory_id = int(memory.get("id") or 0)
+    if not memory_id or random.random() > PET_FRIEND_MEMORY_SHARE_SUGGESTION_CHANCE:
+        return ""
+    now = time.monotonic()
+    last_at = MEMORY_SHARE_SUGGESTION_LAST_BY_CHAT.get(chat_id, 0.0)
+    if now - last_at < PET_FRIEND_MEMORY_SHARE_SUGGESTION_COOLDOWN_SECONDS:
+        return ""
+    try:
+        contacts = _friendship_contacts_for_chat(chat_id)
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        log_exception("friend_memory_share_suggestion_failed", None, exc, chat_id=chat_id)
+        return ""
+    if not contacts:
+        return ""
+    MEMORY_SHARE_SUGGESTION_LAST_BY_CHAT[chat_id] = now
+    target = _contact_label(contacts[0])
+    return f"\n\n这条也许可以分享给好友。愿意的话发：分享记忆 {memory_id} 给 {target}"
+
+
+def maybe_send_friendship_daily_messages(now: Optional[float] = None) -> int:
+    global FRIENDSHIP_DAILY_MESSAGE_SCAN_LAST
+    if not owner_scoping_enabled():
+        return 0
+    current_time = time.monotonic() if now is None else float(now)
+    if (
+        FRIENDSHIP_DAILY_MESSAGE_SCAN_LAST
+        and current_time - FRIENDSHIP_DAILY_MESSAGE_SCAN_LAST
+        < PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS
+    ):
+        return 0
+    FRIENDSHIP_DAILY_MESSAGE_SCAN_LAST = current_time
+
+    sent_count = 0
+    templates = [
+        "{local_pet_name} 给 {friend_pet_name} 发来一条日常小消息：今天也来打个招呼。",
+        "{local_pet_name} 想问问 {friend_pet_name}：今天有没有好好吃饭呀？",
+        "{local_pet_name} 路过好友列表，轻轻戳了戳 {friend_pet_name}。",
+        "{local_pet_name} 给 {friend_pet_name} 留了一句：下次一起玩。",
+    ]
+    for chat_id in sorted(ALLOWED_OWNER_CHAT_IDS):
+        if sent_count >= PET_FRIEND_DAILY_MESSAGE_MAX_PER_SCAN:
+            break
+        try:
+            contacts = _friendship_contacts_for_chat(chat_id)
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            log_exception("friend_daily_message_scan_failed", None, exc, chat_id=chat_id)
+            continue
+        for contact in contacts:
+            if sent_count >= PET_FRIEND_DAILY_MESSAGE_MAX_PER_SCAN:
+                break
+            friendship_id = int(contact["friendship_id"])
+            last_sent = FRIENDSHIP_DAILY_MESSAGE_LAST_SENT.get(friendship_id, 0.0)
+            if last_sent and current_time - last_sent < PET_FRIEND_DAILY_MESSAGE_COOLDOWN_SECONDS:
+                continue
+            affinity = max(0, min(100, int(contact.get("affinity") or 0)))
+            chance = PET_FRIEND_DAILY_MESSAGE_CHANCE * (0.5 + affinity / 100)
+            if random.random() > chance:
+                continue
+            template = random.choice(templates)
+            send_message(
+                str(contact["friend_owner_chat_id"]),
+                template.format(
+                    local_pet_name=contact["local_pet_name"],
+                    friend_pet_name=contact["friend_pet_name"],
+                ),
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+            FRIENDSHIP_DAILY_MESSAGE_LAST_SENT[friendship_id] = current_time
+            sent_count += 1
+    return sent_count
+
+
 def build_relationship_context_for_candidates(
     candidate_pet_ids: list[int],
     relationships: list[dict[str, Any]],
@@ -1322,11 +2174,36 @@ def build_pet_memory_context_for_prompt(
     """Return compact durable memory context for one speaking pet."""
     context: list[dict[str, Any]] = []
     for memory in memories:
+        if memory.get("recall_policy") == "owner_asked_only":
+            continue
+        participants = list(memory.get("participants") or [])
         participant_pet_ids = [
-            int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+            int(participant.get("pet_id"))
+            for participant in participants
+            if participant.get("pet_id") is not None
         ]
-        speaker_participates = int(speaker_pet_id) in participant_pet_ids
-        if not speaker_participates and memory.get("memory_type") == "co_experienced":
+        if not participant_pet_ids:
+            participant_pet_ids = [
+                int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+            ]
+            participants = [
+                {"pet_id": pet_id, "role": "participant"}
+                if memory.get("memory_type") == "co_experienced"
+                else {"pet_id": pet_id, "role": "shared_with"}
+                for pet_id in participant_pet_ids
+            ]
+        speaker_role = ""
+        for participant in participants:
+            if int(participant.get("pet_id")) == int(speaker_pet_id):
+                speaker_role = str(participant.get("role") or "")
+                break
+        speaker_participates = speaker_role == "participant"
+        if memory.get("memory_type") == "co_experienced" and speaker_role not in {
+            "participant",
+            "shared_with",
+        }:
+            continue
+        if speaker_role == "mentioned_only":
             continue
         context.append(
             {
@@ -1335,8 +2212,10 @@ def build_pet_memory_context_for_prompt(
                 "title": memory.get("title") or "",
                 "content": memory.get("content") or "",
                 "source": memory.get("source") or "",
+                "use_class": memory.get("use_class") or "recallable",
                 "emotional_tone": memory.get("emotional_tone") or "",
                 "participant_pet_ids": participant_pet_ids,
+                "speaker_memory_role": speaker_role,
                 "speaker_participates": speaker_participates,
                 "recall_guidance": memory.get("recall_guidance") or "",
             }
@@ -1346,21 +2225,325 @@ def build_pet_memory_context_for_prompt(
     return context
 
 
-def fetch_recent_pet_memories(limit: int = 8) -> list[dict[str, Any]]:
-    """Fetch recent durable memories for Telegram group chat prompting."""
+def _memory_text_for_relevance(memory: dict[str, Any]) -> str:
+    return " ".join(
+        str(memory.get(key) or "")
+        for key in ("title", "content", "emotional_tone")
+    )
+
+
+def _memory_relevance_score(memory: dict[str, Any], owner_text: str) -> int:
+    text = owner_text.strip().lower()
+    memory_text = _memory_text_for_relevance(memory).lower()
+    if not text or not memory_text:
+        return 0
+    score = 0
+    if text in memory_text or memory_text in text:
+        score += 20
+    owner_chars = {char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff"}
+    memory_chars = {char for char in memory_text if char.isalnum() or "\u4e00" <= char <= "\u9fff"}
+    score += len(owner_chars.intersection(memory_chars))
+    return score
+
+
+def _memory_importance(memory: dict[str, Any]) -> int:
     try:
+        return int(memory.get("importance") or 3)
+    except (TypeError, ValueError):
+        return 3
+
+
+def _memory_id(memory: dict[str, Any]) -> int:
+    try:
+        return int(memory.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _scope_and_rank_memories(
+    memories: list[dict[str, Any]],
+    candidate_pet_ids: Optional[list[int]] = None,
+    owner_text: str = "",
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    candidate_set = {int(pet_id) for pet_id in candidate_pet_ids or []}
+    scoped: list[dict[str, Any]] = []
+    for memory in memories:
+        if memory.get("use_class") == "private":
+            continue
+        participant_ids = {
+            int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+        }
+        if candidate_set and participant_ids and not candidate_set.intersection(participant_ids):
+            continue
+        scoped.append(memory)
+    return sorted(
+        scoped,
+        key=lambda memory: (
+            _memory_relevance_score(memory, owner_text),
+            _memory_importance(memory),
+            _memory_id(memory),
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def fetch_recent_pet_memories(
+    chat_id: Optional[str] = None,
+    candidate_pet_ids: Optional[list[int]] = None,
+    owner_text: str = "",
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Fetch scoped durable memories for Telegram group chat prompting."""
+    try:
+        params = {
+            "limit": min(max(limit * 3, limit), 100),
+            "visibility": "home",
+        }
+        if chat_id is not None:
+            params.update(owner_params(chat_id))
         response = requests.get(
             f"{API_BASE_URL}/pet-memories",
-            params={"limit": limit, "visibility": "home"},
+            params=params,
             timeout=10,
         )
         response.raise_for_status()
-        return response.json()
+        return _scope_and_rank_memories(
+            response.json(),
+            candidate_pet_ids=candidate_pet_ids,
+            owner_text=owner_text,
+            limit=limit,
+        )
     except StopIteration:
         return []
     except Exception as exc:
         log_exception("pet_memory_fetch_failed", None, exc)
         return []
+
+
+def _all_pet_ids_for_memory(chat_id: str) -> list[int]:
+    pets = api_get_pets(chat_id)
+    return [int(pet["id"]) for pet in pets]
+
+
+def _memory_command_content(text: str) -> str:
+    value = text.strip()
+    prefixes = [
+        "记住这个：",
+        "记住这个:",
+        "记住这件事：",
+        "记住这件事:",
+        "记住：",
+        "记住:",
+        "记一下：",
+        "记一下:",
+        "记住这个",
+        "记一下",
+    ]
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip(" ：:，,。")
+    return ""
+
+
+def _owner_call_name_preference(text: str) -> str:
+    value = text.strip()
+    prefixes = ["以后都叫我", "以后叫我", "以后请叫我"]
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip(" ：:，,。")
+    return ""
+
+
+def _post_group_memory(
+    chat_id: str,
+    *,
+    title: str,
+    content: str,
+    use_class: str,
+    importance: int = 3,
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    participant_pet_ids = _all_pet_ids_for_memory(chat_id)
+    if not participant_pet_ids:
+        raise RuntimeError("还没有宠物，不能写入长期记忆。")
+    response = requests.post(
+        f"{API_BASE_URL}/pet-memories",
+        **owner_params_kwarg(chat_id),
+        json={
+            "memory_type": "owner_shared",
+            "title": title,
+            "content": content,
+            "source": "telegram",
+            "emotional_tone": "",
+            "importance": importance,
+            "visibility": "home",
+            "use_class": use_class,
+            "participant_pet_ids": participant_pet_ids,
+            "metadata": {
+                "telegram_chat_id": chat_id,
+                **(metadata or {}),
+            },
+        },
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    return response.json()
+
+
+def handle_memory_menu(chat_id: str) -> None:
+    try:
+        owned_pet_ids = set(_all_pet_ids_for_memory(chat_id))
+        params = {
+            **owner_params(chat_id),
+            "limit": 8,
+            "visibility": "home",
+        }
+        response = requests.get(
+            f"{API_BASE_URL}/pet-memories",
+            params=params,
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(response.text)
+        memories = [
+            memory
+            for memory in response.json()
+            if owned_pet_ids.intersection(
+                int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+            )
+        ]
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        send_message(chat_id, f"读取记忆失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    if not memories:
+        send_message(chat_id, "还没有长期记忆。你可以说“记住这个：……”来保存一条。", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    lines = ["最近记忆："]
+    for memory in memories:
+        title = str(memory.get("title") or "未命名记忆")
+        use_class = str(memory.get("use_class") or "recallable")
+        content = str(memory.get("content") or "").replace("\n", " ")
+        if len(content) > 36:
+            content = f"{content[:36]}..."
+        lines.append(f"#{memory.get('id')} [{use_class}] {title}：{content}")
+    lines.append("要删除可以发：忘记记忆 记忆编号")
+    send_message(chat_id, "\n".join(lines), reply_markup=MAIN_REPLY_KEYBOARD)
+
+
+def _delete_memory_from_chat(chat_id: str, memory_id: int) -> None:
+    try:
+        owned_pet_ids = set(_all_pet_ids_for_memory(chat_id))
+        list_response = requests.get(
+            f"{API_BASE_URL}/pet-memories",
+            params={
+                **owner_params(chat_id),
+                "limit": 100,
+                "visibility": "home",
+            },
+            timeout=10,
+        )
+        if list_response.status_code >= 400:
+            raise RuntimeError(list_response.text)
+        allowed_memory_ids = {
+            int(memory["id"])
+            for memory in list_response.json()
+            if owned_pet_ids.intersection(
+                int(pet_id) for pet_id in memory.get("participant_pet_ids") or []
+            )
+        }
+        if int(memory_id) not in allowed_memory_ids:
+            send_message(chat_id, "找不到这条记忆，或它不属于当前聊天。", reply_markup=MAIN_REPLY_KEYBOARD)
+            return
+        response = requests.delete(
+            f"{API_BASE_URL}/pet-memories/{memory_id}",
+            **owner_params_kwarg(chat_id),
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(response.text)
+        memory = response.json()
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        send_message(chat_id, f"删除记忆失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    title = str(memory.get("title") or f"#{memory_id}")
+    send_message(chat_id, f"已忘记：{title}", reply_markup=MAIN_REPLY_KEYBOARD)
+
+
+def handle_pet_memory_text(chat_id: str, text: str) -> bool:
+    value = text.strip()
+    if not value:
+        return False
+    if value == "宠物记忆":
+        handle_memory_menu(chat_id)
+        return True
+    if start_friend_memory_share_confirmation(chat_id, value):
+        return True
+
+    for prefix in ("忘记记忆", "删除记忆"):
+        if value.startswith(prefix):
+            raw_id = value[len(prefix) :].strip(" #：:")
+            if not raw_id.isdigit():
+                send_message(chat_id, "要删除哪条记忆？可以发：忘记记忆 9", reply_markup=MAIN_REPLY_KEYBOARD)
+                return True
+            _delete_memory_from_chat(chat_id, int(raw_id))
+            return True
+
+    memory_content = _memory_command_content(value)
+    if memory_content:
+        try:
+            memory = _post_group_memory(
+                chat_id,
+                title="群聊记忆",
+                content=memory_content,
+                use_class="recallable",
+                importance=4,
+                metadata={
+                    "capture_rule": "explicit_remember",
+                    "raw_text": value,
+                },
+            )
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            send_message(chat_id, f"保存记忆失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        send_message(
+            chat_id,
+            f"记下了。记忆编号：{memory.get('id')}"
+            f"{_memory_share_suggestion_text(chat_id, memory)}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return True
+
+    call_name = _owner_call_name_preference(value)
+    if call_name:
+        try:
+            memory = _post_group_memory(
+                chat_id,
+                title="称呼偏好",
+                content=f"主人希望宠物以后叫 TA {call_name}。",
+                use_class="behavioral",
+                importance=4,
+                metadata={
+                    "capture_rule": "owner_call_name_preference",
+                    "raw_text": value,
+                    "preferred_call_name": call_name,
+                },
+            )
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            send_message(chat_id, f"保存称呼偏好失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        send_message(
+            chat_id,
+            f"好，我记下了，以后叫你{call_name}。记忆编号：{memory.get('id')}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return True
+
+    return False
 
 
 def _group_chat_text_from_llm(response: dict[str, Any]) -> str:
@@ -1420,12 +2603,50 @@ def build_pet_group_responder_plan_messages(
     ]
 
 
+def _normalize_pet_reference(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[\s_\-·•.。・]+", "", normalized)
+
+
+def _pet_reference_tokens(value: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", normalized)
+
+
 def _directly_mentioned_pets(owner_text: str, pets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mentioned: list[dict[str, Any]] = []
+    normalized_text = _normalize_pet_reference(owner_text)
+    fuzzy_matches: list[tuple[float, dict[str, Any]]] = []
     for pet in pets:
         name = str(pet.get("name") or "").strip()
         if name and name in owner_text:
             mentioned.append(pet)
+            continue
+        normalized_name = _normalize_pet_reference(name)
+        if normalized_name and normalized_name in normalized_text:
+            mentioned.append(pet)
+            continue
+        if len(normalized_name) < 5:
+            continue
+        best_score = 0.0
+        for token in _pet_reference_tokens(owner_text):
+            normalized_token = _normalize_pet_reference(token)
+            if not normalized_token:
+                continue
+            best_score = max(
+                best_score,
+                SequenceMatcher(None, normalized_token, normalized_name).ratio(),
+            )
+        if best_score >= 0.88:
+            fuzzy_matches.append((best_score, pet))
+    if fuzzy_matches:
+        fuzzy_matches.sort(key=lambda item: item[0], reverse=True)
+        top_score = fuzzy_matches[0][0]
+        ambiguous = len(fuzzy_matches) > 1 and fuzzy_matches[1][0] >= top_score - 0.03
+        if not ambiguous:
+            fuzzy_pet = fuzzy_matches[0][1]
+            if all(int(pet.get("id")) != int(fuzzy_pet.get("id")) for pet in mentioned):
+                mentioned.append(fuzzy_pet)
     return mentioned
 
 
@@ -1608,7 +2829,12 @@ def handle_pet_group_chat_text(
         relationships_response = requests.get(f"{API_BASE_URL}/pet-relationships", timeout=10)
         relationships_response.raise_for_status()
         relationships = relationships_response.json()
-        memories = fetch_recent_pet_memories(limit=8)
+        memories = fetch_recent_pet_memories(
+            chat_id=chat_id,
+            candidate_pet_ids=candidate_ids,
+            owner_text=text.strip(),
+            limit=8,
+        )
         sent_speaker_ids: list[int] = []
         primary_reply = ""
         for speaker in responders:
@@ -2050,10 +3276,55 @@ def _looks_like_co_experienced_memory(text: str) -> bool:
         "共同",
         "一块",
     ]
+    return any(signal in normalized for signal in shared_signals) and _has_photo_moment_signal(normalized)
+
+
+def _looks_like_sensitive_memory(text: str) -> bool:
+    normalized = text.strip()
+    sensitive_signals = [
+        "失眠",
+        "崩溃",
+        "哭",
+        "医院",
+        "生病",
+        "病",
+        "抑郁",
+        "焦虑",
+        "难过",
+        "压力",
+        "加班",
+        "吵架",
+        "分手",
+        "离婚",
+        "钱",
+        "工资",
+        "身份证",
+    ]
+    return any(signal in normalized for signal in sensitive_signals)
+
+
+def _is_memory_cancel_text(text: str) -> bool:
+    normalized = text.strip()
+    cancel_signals = ["不要记", "别记", "不用记", "不记", "只是看看", "别保存", "不要保存"]
+    return any(signal in normalized for signal in cancel_signals)
+
+
+def _is_memory_confirm_text(text: str) -> bool:
+    normalized = text.strip()
+    confirm_signals = ["记住", "保存", "可以", "好", "嗯"]
+    return any(signal in normalized for signal in confirm_signals)
+
+
+def _has_photo_moment_signal(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
     moment_signals = [
         "拍",
         "照片",
+        "图片",
         "去了",
+        "出去",
         "去",
         "看",
         "玩",
@@ -2066,9 +3337,7 @@ def _looks_like_co_experienced_memory(text: str) -> bool:
         "昨晚",
         "刚才",
     ]
-    return any(signal in normalized for signal in shared_signals) and any(
-        signal in normalized for signal in moment_signals
-    )
+    return any(signal in normalized for signal in moment_signals)
 
 
 def _memory_title_from_text(text: str) -> str:
@@ -2080,13 +3349,30 @@ def _list_pets_for_memory(chat_id: str) -> list[dict[str, Any]]:
     return api_get_pets(chat_id)
 
 
-def _create_photo_memory_from_text(chat_id: str, text: str, flow: dict[str, Any]) -> dict[str, Any]:
-    pets = _list_pets_for_memory(chat_id)
-    if not pets:
+def _photo_memory_metadata(chat_id: str, flow: dict[str, Any], capture_rule: str) -> dict[str, Any]:
+    return {
+        "capture_rule": capture_rule,
+        "telegram_chat_id": chat_id,
+        "telegram_photo_file_id": flow.get("photo_file_id"),
+        "telegram_photo_message_id": flow.get("message_id"),
+        "telegram_photo_caption": flow.get("caption", ""),
+    }
+
+
+def _create_photo_memory_from_text(
+    chat_id: str,
+    text: str,
+    flow: dict[str, Any],
+    participant_pets: list[dict[str, Any]],
+    visibility: str = "home",
+    recall_policy: str = "normal",
+) -> dict[str, Any]:
+    if not participant_pets:
         raise RuntimeError("还没有宠物，不能写入共同记忆。")
-    participant_pet_ids = [int(pet["id"]) for pet in pets]
+    participant_pet_ids = [int(pet["id"]) for pet in participant_pets]
     response = requests.post(
         f"{API_BASE_URL}/pet-memories",
+        **owner_params_kwarg(chat_id),
         json={
             "memory_type": "co_experienced",
             "title": _memory_title_from_text(text),
@@ -2094,20 +3380,60 @@ def _create_photo_memory_from_text(chat_id: str, text: str, flow: dict[str, Any]
             "source": "telegram",
             "emotional_tone": "warm",
             "importance": 4,
-            "visibility": "home",
+            "visibility": visibility,
+            "recall_policy": recall_policy,
             "participant_pet_ids": participant_pet_ids,
-            "metadata": {
-                "telegram_chat_id": chat_id,
-                "telegram_photo_file_id": flow.get("photo_file_id"),
-                "telegram_photo_message_id": flow.get("message_id"),
-                "telegram_photo_caption": flow.get("caption", ""),
-            },
+            "participants": [
+                {"pet_id": pet_id, "role": "participant"}
+                for pet_id in participant_pet_ids
+            ],
+            "metadata": _photo_memory_metadata(chat_id, flow, "co_experienced_photo"),
         },
         timeout=10,
     )
     if response.status_code >= 400:
         raise RuntimeError(response.text)
     return response.json()
+
+
+def _create_pet_photo_memory_from_text(
+    chat_id: str,
+    text: str,
+    flow: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if not _has_photo_moment_signal(text):
+        return None
+    pets = _list_pets_for_memory(chat_id)
+    mentioned_pets = _directly_mentioned_pets(text, pets)
+    if not mentioned_pets:
+        return None
+    participant_pet_ids = [int(pet["id"]) for pet in mentioned_pets]
+    response = requests.post(
+        f"{API_BASE_URL}/pet-memories",
+        **owner_params_kwarg(chat_id),
+        json={
+            "memory_type": "pet_milestone",
+            "title": _memory_title_from_text(text),
+            "content": text.strip(),
+            "source": "telegram",
+            "emotional_tone": "warm",
+            "importance": 3,
+            "visibility": "home",
+            "use_class": "recallable",
+            "participant_pet_ids": participant_pet_ids,
+            "metadata": _photo_memory_metadata(chat_id, flow, "pet_photo_moment"),
+        },
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(response.text)
+    memory = response.json()
+    memory["mentioned_pet_names"] = [
+        str(pet.get("name") or "").strip()
+        for pet in mentioned_pets
+        if str(pet.get("name") or "").strip()
+    ]
+    return memory
 
 
 def handle_memory_photo(chat_id: str, message: dict[str, Any]) -> bool:
@@ -2121,13 +3447,65 @@ def handle_memory_photo(chat_id: str, message: dict[str, Any]) -> bool:
         "photo_file_id": file_id,
         "message_id": message.get("message_id"),
         "caption": (message.get("caption") or "").strip(),
+        "step": "await_story",
+        "created_monotonic": time.monotonic(),
     }
     send_message(
         chat_id,
-        "我看到这张照片啦。这是我们一起经历的吗？你给我讲讲当时发生了什么，我会判断要不要把它记成共同记忆。",
+        "我看到这张照片啦。这里面有哪只宠物的回忆吗？你给我讲讲当时发生了什么、哪些宠物在这段回忆里。",
         reply_markup=MAIN_REPLY_KEYBOARD,
     )
     return True
+
+
+def _ask_for_memory_participants(chat_id: str, flow: dict[str, Any], content: str) -> None:
+    flow["step"] = "await_participants"
+    flow["pending_content"] = content
+    try:
+        pets = _list_pets_for_memory(chat_id)
+        pet_names = "、".join(
+            str(pet.get("name") or "").strip()
+            for pet in pets
+            if str(pet.get("name") or "").strip()
+        )
+    except (RuntimeError, requests.RequestException, ValueError):
+        pet_names = ""
+    suffix = f"现在的宠物有：{pet_names}。" if pet_names else ""
+    send_message(
+        chat_id,
+        f"这听起来像共同经历。是哪几只宠物在这段回忆里？请直接告诉我名字。{suffix}",
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
+
+
+def _memory_photo_flow_expired(flow: dict[str, Any]) -> bool:
+    created = flow.get("created_monotonic")
+    if created is None:
+        return False
+    try:
+        return time.monotonic() - float(created) > MEMORY_PHOTO_PENDING_TTL_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def _pet_refs_from_ids(pet_ids: list[int]) -> list[dict[str, Any]]:
+    return [{"id": int(pet_id)} for pet_id in pet_ids]
+
+
+def _ask_sensitive_memory_confirmation(
+    chat_id: str,
+    flow: dict[str, Any],
+    content: str,
+    participant_pets: list[dict[str, Any]],
+) -> None:
+    flow["step"] = "await_sensitive_confirm"
+    flow["pending_content"] = content
+    flow["pending_participant_pet_ids"] = [int(pet["id"]) for pet in participant_pets]
+    send_message(
+        chat_id,
+        "这听起来很重要，也有点私密。要我长期记住吗？如果记住，我只会在你问起时提。",
+        reply_markup=MAIN_REPLY_KEYBOARD,
+    )
 
 
 def handle_memory_photo_text(chat_id: str, text: str) -> bool:
@@ -2137,7 +3515,109 @@ def handle_memory_photo_text(chat_id: str, text: str) -> bool:
     content = text.strip()
     if not content:
         return False
+    if _memory_photo_flow_expired(flow):
+        PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+        send_message(
+            chat_id,
+            "这张照片的记忆记录已经过期啦。你可以重新发一次照片，我再认真听你讲。",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return True
+    if _is_memory_cancel_text(content):
+        PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+        send_message(
+            chat_id,
+            "好，我只当作看过这张照片，不写进长期记忆。",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return True
+    if flow.get("step") == "await_sensitive_confirm":
+        if not _is_memory_confirm_text(content):
+            send_message(
+                chat_id,
+                "如果要长期记住，请回复“记住”；如果不想保存，可以说“不要记住”。",
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+            return True
+        try:
+            memory = _create_photo_memory_from_text(
+                chat_id,
+                str(flow.get("pending_content") or content),
+                flow,
+                _pet_refs_from_ids([int(pet_id) for pet_id in flow.get("pending_participant_pet_ids") or []]),
+                visibility="private",
+                recall_policy="owner_asked_only",
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            log_exception("pet_memory_photo_create_failed", None, exc, chat_id=chat_id)
+            send_message(chat_id, f"共同记忆保存失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+        send_message(
+            chat_id,
+            f"记住了。我会把它小心收好，只会在你问起时提。记忆编号：{memory.get('id')}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return True
+    if flow.get("step") == "await_participants":
+        try:
+            pets = _list_pets_for_memory(chat_id)
+            mentioned_pets = _directly_mentioned_pets(content, pets)
+            if not mentioned_pets:
+                send_message(
+                    chat_id,
+                    "我还没确认是哪几只宠物。请直接发宠物名字，或说“不要记住”。",
+                    reply_markup=MAIN_REPLY_KEYBOARD,
+                )
+                return True
+            if _looks_like_sensitive_memory(str(flow.get("pending_content") or content)):
+                _ask_sensitive_memory_confirmation(
+                    chat_id,
+                    flow,
+                    str(flow.get("pending_content") or content),
+                    mentioned_pets,
+                )
+                return True
+            memory = _create_photo_memory_from_text(
+                chat_id,
+                str(flow.get("pending_content") or content),
+                flow,
+                mentioned_pets,
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            log_exception("pet_memory_photo_create_failed", None, exc, chat_id=chat_id)
+            send_message(chat_id, f"共同记忆保存失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+        pet_names = "、".join(
+            str(pet.get("name") or "").strip()
+            for pet in mentioned_pets
+            if str(pet.get("name") or "").strip()
+        )
+        send_message(
+            chat_id,
+            f"记住了。这是你和 {pet_names} 的共同记忆。记忆编号：{memory.get('id')}",
+            reply_markup=MAIN_REPLY_KEYBOARD,
+        )
+        return True
     if not _looks_like_co_experienced_memory(content):
+        try:
+            pet_memory = _create_pet_photo_memory_from_text(chat_id, content, flow)
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
+            log_exception("pet_photo_memory_create_failed", None, exc, chat_id=chat_id)
+            send_message(chat_id, f"照片记忆保存失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
+            return True
+        if pet_memory:
+            PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+            pet_names = "、".join(pet_memory.get("mentioned_pet_names") or [])
+            subject_text = f"{pet_names}的" if pet_names else "这只宠物的"
+            send_message(
+                chat_id,
+                f"记下了。这张照片会作为{subject_text}回忆参考。记忆编号：{pet_memory.get('id')}",
+                reply_markup=MAIN_REPLY_KEYBOARD,
+            )
+            handle_pet_group_chat_text(chat_id, content)
+            return True
         PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
         send_message(
             chat_id,
@@ -2146,15 +3626,28 @@ def handle_memory_photo_text(chat_id: str, text: str) -> bool:
         )
         return True
     try:
-        memory = _create_photo_memory_from_text(chat_id, content, flow)
+        pets = _list_pets_for_memory(chat_id)
+        mentioned_pets = _directly_mentioned_pets(content, pets)
+        if not mentioned_pets:
+            _ask_for_memory_participants(chat_id, flow, content)
+            return True
+        if _looks_like_sensitive_memory(content):
+            _ask_sensitive_memory_confirmation(chat_id, flow, content, mentioned_pets)
+            return True
+        memory = _create_photo_memory_from_text(chat_id, content, flow, mentioned_pets)
     except (RuntimeError, requests.RequestException) as exc:
         log_exception("pet_memory_photo_create_failed", None, exc, chat_id=chat_id)
         send_message(chat_id, f"共同记忆保存失败：{exc}", reply_markup=MAIN_REPLY_KEYBOARD)
         return True
     PENDING_MEMORY_PHOTO_FLOWS.pop(chat_id, None)
+    pet_names = "、".join(
+        str(pet.get("name") or "").strip()
+        for pet in mentioned_pets
+        if str(pet.get("name") or "").strip()
+    )
     send_message(
         chat_id,
-        f"记住了。这张照片已经成为我们的共同记忆了。记忆编号：{memory.get('id')}",
+        f"记住了。这是你和 {pet_names} 的共同记忆。记忆编号：{memory.get('id')}",
         reply_markup=MAIN_REPLY_KEYBOARD,
     )
     return True
@@ -2889,6 +4382,10 @@ def handle_action_button(chat_id: str, action: str) -> None:
     pet = next((item for item in pets if int(item["id"]) == pet_id), {"name": "宠物"})
     event_result = result.get("event_result") or {}
     generated_message = (event_result.get("message") or {}).get("message")
+    generated_message = format_speaker_labeled_message(
+        generated_message or "",
+        str(event_result.get("pet_name") or pet.get("name") or ""),
+    )
     send_message(
         chat_id,
         format_action_reply(
@@ -2946,6 +4443,7 @@ def handle_callback(callback_query: dict[str, Any]) -> None:
     chat_id = str(chat.get("id", ""))
     if not is_chat_allowed(chat_id):
         return
+    remember_owner_display_name(chat_id, callback_query.get("from"))
 
     if callback_id:
         answer_callback(callback_id)
@@ -3127,6 +4625,7 @@ def handle_message(message: dict[str, Any]) -> None:
     if not is_chat_allowed(chat_id):
         send_message(chat_id, "当前需要邀请或订阅后才能使用这个宠物助手。")
         return
+    remember_owner_display_name(chat_id, message.get("from"))
 
     text = (message.get("text") or "").strip()
     if handle_avatar_photo(chat_id, message):
@@ -3145,6 +4644,12 @@ def handle_message(message: dict[str, Any]) -> None:
         return
     if handle_memory_photo_text(chat_id, text):
         return
+    if handle_friend_memory_share_confirmation_text(chat_id, text):
+        return
+    if handle_pet_memory_text(chat_id, text):
+        return
+    if handle_friend_owner_share_text(chat_id, text):
+        return
 
     if text.startswith("/start"):
         send_main_menu(chat_id)
@@ -3160,8 +4665,12 @@ def handle_message(message: dict[str, Any]) -> None:
         start_relationship_flow(chat_id)
     elif text == "宠物好友":
         start_friendship_invite_flow(chat_id)
+    elif text == "宠物记忆":
+        handle_memory_menu(chat_id)
     elif text == "创建宠物":
         start_pet_create_flow(chat_id)
+    elif text == "小助手":
+        handle_assistant_text(chat_id, text)
     elif text == "设置资料":
         send_message(chat_id, "资料设置已经移到「宠物列表」里，每只宠物卡片下都有设置入口。", reply_markup=MAIN_REPLY_KEYBOARD)
     elif text == "定制形象":
@@ -3169,6 +4678,8 @@ def handle_message(message: dict[str, Any]) -> None:
         send_message(chat_id, "形象定制入口已经移到创建宠物后的下一步。", reply_markup=MAIN_REPLY_KEYBOARD)
     elif text in ACTION_BUTTON_MAP:
         handle_action_button(chat_id, ACTION_BUTTON_MAP[text])
+    elif handle_assistant_text(chat_id, text):
+        return
     elif handle_pet_group_chat_text(chat_id, text):
         return
 
@@ -3229,9 +4740,21 @@ def poll_forever() -> None:
                     except Exception:
                         pass
 
+        try:
+            maybe_send_friendship_daily_messages()
+        except Exception as exc:
+            log_exception("friend_daily_message_tick_failed", None, exc)
+
+        try:
+            maybe_send_due_assistant_items()
+        except Exception as exc:
+            log_exception("assistant_due_scan_tick_failed", None, exc)
+
         time.sleep(1)
 
 
 if __name__ == "__main__":
     configure_bot_ui()
+    if PROACTIVE_TICKS_ENABLED:
+        start_proactive_tick_loop()
     poll_forever()

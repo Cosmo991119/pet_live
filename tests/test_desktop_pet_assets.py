@@ -131,7 +131,7 @@ class DesktopPetAssetsTest(unittest.TestCase):
                 patch("desktop_pet_assets.STATIC_DIR", static),
                 patch("desktop_pet_assets.ASSET_ROOT", static / "desktop_pet_assets"),
             ):
-                build_desktop_pet_assets(
+                result = build_desktop_pet_assets(
                     {
                         "id": "character-1",
                         "image_url": "/static/generated/source.png",
@@ -181,7 +181,7 @@ class DesktopPetAssetsTest(unittest.TestCase):
                 patch("desktop_pet_assets.STATIC_DIR", static),
                 patch("desktop_pet_assets.ASSET_ROOT", static / "desktop_pet_assets"),
             ):
-                build_desktop_pet_assets(
+                result = build_desktop_pet_assets(
                     {
                         "id": "character-1",
                         "image_url": "/static/generated/source.png",
@@ -197,6 +197,94 @@ class DesktopPetAssetsTest(unittest.TestCase):
             self.assertEqual(list(ImageOps.mirror(right).getdata()), list(left.getdata()))
             manifest = json.loads((asset_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual("mirrored_from_walk_right", manifest["pose_sources"]["walk_left"]["source"])
+
+    def test_full_video_generator_mirrors_walk_left_from_walk_right_gif(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            static = root / "static"
+            source = static / "generated" / "source.png"
+            source.parent.mkdir(parents=True)
+            self._write_marker_image(source, (220, 40, 40, 255))
+            generated_specs = []
+
+            def fake_wan_generator(character, spec, output_dir):
+                generated_specs.append(spec.name)
+                paths = []
+                for index in range(1, spec.frame_count + 1):
+                    path = output_dir / f"{spec.name}_model_frame_{index}.png"
+                    image = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+                    for y in range(28, 68):
+                        for x in range(18, 46):
+                            image.putpixel((x, y), (40 * index, 180, 90, 255))
+                    for y in range(36, 56):
+                        for x in range(58, 66):
+                            image.putpixel((x, y), (40, 40, 220, 255))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    image.save(path)
+                    paths.append(path)
+                gif_frames = []
+                for index in range(1, 7):
+                    image = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+                    for y in range(28, 68):
+                        for x in range(14, 44):
+                            image.putpixel((x, y), (30 * index, 180, 90, 255))
+                    for y in range(36, 56):
+                        for x in range(60, 70):
+                            image.putpixel((x, y), (40, 40, 220, 255))
+                    gif_frames.append(image)
+                _save_gif(output_dir / f"{spec.name}.gif", gif_frames, duration=833)
+                return paths
+
+            fake_wan_generator.__name__ = "_generate_wan_desktop_behavior_frames"
+
+            with (
+                patch("desktop_pet_assets.PROJECT_ROOT", root),
+                patch("desktop_pet_assets.STATIC_DIR", static),
+                patch("desktop_pet_assets.ASSET_ROOT", static / "desktop_pet_assets"),
+            ):
+                result = build_desktop_pet_assets(
+                    {
+                        "id": "character-1",
+                        "image_url": "/static/generated/source.png",
+                    },
+                    frame_sequence_generator=fake_wan_generator,
+                    animation_names=["walk_right", "walk_left"],
+                )
+
+            asset_dir = static / "desktop_pet_assets" / "character-1"
+            manifest = json.loads((asset_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(["walk_right"], generated_specs)
+            self.assertEqual("mirrored_from_walk_right", manifest["pose_sources"]["walk_left"]["source"])
+            self.assertEqual("wan_full_video", manifest["animations"]["walk_right"]["source"])
+            self.assertEqual("wan_full_video_mirrored", manifest["animations"]["walk_left"]["source"])
+            self.assertIn("?v=", result["desktop_pet_manifest_url"])
+            self.assertIn(
+                manifest["asset_version"],
+                {
+                    manifest["animations"]["walk_right"]["cache_bust"],
+                    manifest["animations"]["walk_left"]["cache_bust"],
+                },
+            )
+            self.assertNotEqual("walk_right.gif", manifest["animations"]["walk_right"]["src"])
+            self.assertNotEqual("walk_left.gif", manifest["animations"]["walk_left"]["src"])
+            self.assertTrue((asset_dir / manifest["animations"]["walk_right"]["src"]).exists())
+            self.assertTrue((asset_dir / manifest["animations"]["walk_left"]["src"]).exists())
+            with Image.open(asset_dir / "walk_right.gif") as right_image:
+                right_frames = [
+                    frame.copy().convert("RGBA")
+                    for frame in ImageSequence.Iterator(right_image)
+                ]
+            with Image.open(asset_dir / "walk_left.gif") as left_image:
+                left_frames = [
+                    frame.copy().convert("RGBA")
+                    for frame in ImageSequence.Iterator(left_image)
+                ]
+            self.assertEqual(6, len(right_frames))
+            self.assertEqual(6, len(left_frames))
+            self.assertEqual(
+                list(ImageOps.mirror(right_frames[0]).getdata()),
+                list(left_frames[0].getdata()),
+            )
 
     def test_can_request_full_extended_animation_pack_explicitly(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -237,6 +325,16 @@ class DesktopPetAssetsTest(unittest.TestCase):
             [spec.name for spec in animation_specs_for()],
         )
         self.assertNotIn("relax", BASIC_DESKTOP_ANIMATION_NAMES)
+
+    def test_walk_specs_prompt_aquatic_creatures_to_swim(self):
+        specs = {spec.name: spec for spec in animation_specs_for(["walk_right", "walk_left"])}
+
+        for spec in specs.values():
+            self.assertIn("octopus or other marine/aquatic", spec.prompt)
+            self.assertIn("swimming posture", spec.prompt)
+            self.assertIn("swimming-drift motion", spec.prompt)
+            self.assertIn("fins, tail, tentacles, or body undulation", spec.prompt)
+            self.assertNotIn("crawl", spec.prompt)
 
     def test_fallback_frames_do_not_apply_programmatic_motion(self):
         pose = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
@@ -329,11 +427,52 @@ class DesktopPetAssetsTest(unittest.TestCase):
             manifest = json.loads((asset_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual("behavior-frame-gif-partial", manifest["format"])
             self.assertEqual("partial_ready", manifest["generation_status"])
-            self.assertEqual({"idle", "walk_right"}, set(manifest["animations"]))
-            self.assertEqual(["idle", "walk_right"], result["published_animations"])
+            self.assertEqual({"idle", "walk_left", "walk_right"}, set(manifest["animations"]))
+            self.assertEqual(["idle", "walk_left", "walk_right"], result["published_animations"])
             self.assertEqual("generated_behavior_frame_sequence", manifest["pose_sources"]["idle"]["source"])
+            self.assertEqual("mirrored_from_walk_right", manifest["pose_sources"]["walk_left"]["source"])
             self.assertEqual(4, len(manifest["animations"]["walk_right"]["frames"]))
+            self.assertEqual(4, len(manifest["animations"]["walk_left"]["frames"]))
             self.assertTrue((asset_dir / "walk_right.gif").exists())
+
+    def test_publish_mirrors_walk_left_from_walk_right_frame_sequence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            static = root / "static"
+            source = static / "generated" / "source.png"
+            source.parent.mkdir(parents=True)
+            self._write_marker_image(source, (220, 40, 40, 255))
+            asset_dir = static / "desktop_pet_assets" / "character-1"
+            for index in range(1, 5):
+                path = asset_dir / f"walk_right_model_frame_{index}.png"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                image = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+                for y in range(28, 68):
+                    for x in range(18, 46):
+                        image.putpixel((x, y), (220, 40, 40, 255))
+                for y in range(36, 56):
+                    for x in range(58, 66):
+                        image.putpixel((x, y), (40, 40, 220, 255))
+                image.save(path)
+            self._write_marker_sheet(asset_dir / "walk_left_model_sheet.png", 4)
+
+            with (
+                patch("desktop_pet_assets.PROJECT_ROOT", root),
+                patch("desktop_pet_assets.STATIC_DIR", static),
+                patch("desktop_pet_assets.ASSET_ROOT", static / "desktop_pet_assets"),
+            ):
+                result = publish_existing_behavior_assets(
+                    {
+                        "id": "character-1",
+                        "image_url": "/static/generated/source.png",
+                    }
+                )
+
+            manifest = json.loads((asset_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual("mirrored_from_walk_right", manifest["pose_sources"]["walk_left"]["source"])
+            right = Image.open(asset_dir / "walk_right_frame_1.png").convert("RGBA")
+            left = Image.open(asset_dir / "walk_left_frame_1.png").convert("RGBA")
+            self.assertEqual(list(ImageOps.mirror(right).getdata()), list(left.getdata()))
 
     def test_publish_keeps_existing_long_gif_for_generated_frame_sequence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -355,7 +494,7 @@ class DesktopPetAssetsTest(unittest.TestCase):
                 patch("desktop_pet_assets.STATIC_DIR", static),
                 patch("desktop_pet_assets.ASSET_ROOT", static / "desktop_pet_assets"),
             ):
-                publish_existing_behavior_assets(
+                result = publish_existing_behavior_assets(
                     {
                         "id": "character-1",
                         "image_url": "/static/generated/source.png",
@@ -364,6 +503,30 @@ class DesktopPetAssetsTest(unittest.TestCase):
 
             with Image.open(asset_dir / "walk_right.gif") as image:
                 self.assertEqual(8, sum(1 for _ in ImageSequence.Iterator(image)))
+            with Image.open(asset_dir / "walk_right.gif") as right_image:
+                right_frames = [
+                    frame.copy().convert("RGBA")
+                    for frame in ImageSequence.Iterator(right_image)
+                ]
+            with Image.open(asset_dir / "walk_left.gif") as left_image:
+                left_frames = [
+                    frame.copy().convert("RGBA")
+                    for frame in ImageSequence.Iterator(left_image)
+                ]
+            self.assertEqual(8, len(left_frames))
+            self.assertEqual(
+                list(ImageOps.mirror(right_frames[0]).getdata()),
+                list(left_frames[0].getdata()),
+            )
+            manifest = json.loads((asset_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual("wan_full_video", manifest["animations"]["walk_right"]["source"])
+            self.assertEqual("wan_full_video_mirrored", manifest["animations"]["walk_left"]["source"])
+            self.assertEqual("mirrored_from_walk_right", manifest["pose_sources"]["walk_left"]["source"])
+            self.assertIn("?v=", result["desktop_pet_manifest_url"])
+            self.assertNotEqual("walk_right.gif", manifest["animations"]["walk_right"]["src"])
+            self.assertNotEqual("walk_left.gif", manifest["animations"]["walk_left"]["src"])
+            self.assertTrue((asset_dir / manifest["animations"]["walk_right"]["src"]).exists())
+            self.assertTrue((asset_dir / manifest["animations"]["walk_left"]["src"]).exists())
 
     @staticmethod
     def _write_marker_image(path: Path, color: tuple[int, int, int, int]) -> None:

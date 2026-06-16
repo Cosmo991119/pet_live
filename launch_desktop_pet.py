@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -31,15 +32,49 @@ def _default_virtual_pet_id() -> int:
     raise RuntimeError("No pet exists yet. Create a virtual pet in the web UI first.")
 
 
-def _static_path(static_url: str) -> Optional[Path]:
+def _static_path(static_url: str, project_root: Path = PROJECT_ROOT) -> Optional[Path]:
     clean = static_url.split("?", 1)[0]
     if not clean.startswith("/static/"):
         return None
-    path = (PROJECT_ROOT / clean.removeprefix("/")).resolve()
-    static_root = (PROJECT_ROOT / "static").resolve()
+    path = (project_root / clean.removeprefix("/")).resolve()
+    static_root = (project_root / "static").resolve()
     if static_root not in path.parents:
         return None
     return path if path.exists() else None
+
+
+def build_desktop_pet_command(
+    pet: dict[str, Any],
+    offset_index: int,
+    api_base_url: Optional[str] = None,
+    project_root: Path = PROJECT_ROOT,
+) -> list[str]:
+    profile = _profile(pet)
+    manifest_path = _static_path(profile.get("desktop_pet_manifest_url", ""), project_root)
+    image_path = _static_path(profile.get("desktop_pet_avatar_url", ""), project_root)
+    if image_path is None:
+        image_path = _static_path(profile.get("avatar_image_url", ""), project_root)
+
+    command = [
+        "swift",
+        str(project_root / "desktop_pet_mac.swift"),
+        "--name",
+        str(pet["name"]),
+        "--api-base",
+        api_base_url or os.getenv("PET_AGENT_API_URL", "http://127.0.0.1:8000"),
+        "--pet-id",
+        str(pet["id"]),
+        "--offset-index",
+        str(offset_index),
+    ]
+    owner_id = pet.get("owner_id")
+    if owner_id is not None:
+        command.extend(["--owner-id", str(owner_id)])
+    if image_path is not None:
+        command.extend(["--image", str(image_path)])
+    if manifest_path is not None:
+        command.extend(["--manifest", str(manifest_path)])
+    return command
 
 
 def main() -> None:
@@ -53,22 +88,7 @@ def main() -> None:
     if pet is None:
         raise RuntimeError(f"pet_id {pet_id} does not exist")
 
-    profile = _profile(pet)
-    manifest_path = _static_path(profile.get("desktop_pet_manifest_url", ""))
-    image_path = _static_path(profile.get("desktop_pet_avatar_url", ""))
-    if image_path is None:
-        image_path = _static_path(profile.get("avatar_image_url", ""))
-    command = [
-        "swift",
-        str(PROJECT_ROOT / "desktop_pet_mac.swift"),
-        "--name",
-        pet["name"],
-    ]
-    if image_path is not None:
-        command.extend(["--image", str(image_path)])
-    if manifest_path is not None:
-        command.extend(["--manifest", str(manifest_path)])
-    command.extend(["--offset-index", str(args.offset_index)])
+    command = build_desktop_pet_command(pet, args.offset_index)
 
     subprocess.run(command, check=True)
 

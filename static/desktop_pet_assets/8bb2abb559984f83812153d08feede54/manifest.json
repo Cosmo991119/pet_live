@@ -25,18 +25,18 @@
     },
     "relax": {
       "src": "relax_pose.png",
-      "source": "generated_behavior_frames",
+      "source": "generated_behavior_frame_sequence",
       "prompt": "lounging lazily in a cozy relaxed pose, peaceful and idle, full body visible"
     },
     "walk_right": {
       "src": "walk_right_pose.png",
       "source": "generated_behavior_frame_sequence",
-      "prompt": "walking in place while facing right, one foot forward, lively step-cycle pose, full body visible"
+      "prompt": "moving in place while facing right, species-accurate locomotion cycle: humanoids may step naturally, land animals use a natural gait, and octopus or other marine/aquatic creatures use a swimming posture; octopus or tentacled sea creatures use swimming-drift motion with a suspended gliding body and tentacles rippling like soft ribbons, while other aquatic creatures use fins, tail, tentacles, or body undulation, full body visible"
     },
     "walk_left": {
       "src": "walk_left_pose.png",
-      "source": "generated_behavior_frames",
-      "prompt": "walking in place while facing left, one foot forward, lively step-cycle pose, full body visible"
+      "source": "mirrored_from_walk_right",
+      "prompt": "moving in place while facing left, species-accurate locomotion cycle: humanoids may step naturally, land animals use a natural gait, and octopus or other marine/aquatic creatures use a swimming posture; octopus or tentacled sea creatures use swimming-drift motion with a suspended gliding body and tentacles rippling like soft ribbons, while other aquatic creatures use fins, tail, tentacles, or body undulation, full body visible"
     },
     "sleep": {
       "src": "sleep_pose.png",
@@ -47,60 +47,68 @@
   "animations": {
     "idle": {
       "type": "gif",
-      "src": "idle_wan_fullvideo_1779561503.gif",
-      "source": "wan_full_video",
+      "src": "idle_18b3ce97461ad7b9_1b194e.gif",
       "pose": "idle_pose.png",
       "frames": [
         "idle_frame_1.png",
         "idle_frame_2.png",
         "idle_frame_3.png",
         "idle_frame_4.png"
-      ]
+      ],
+      "source": "wan_full_video",
+      "cache_bust": "18b3ce97461ad7b9_1b194e"
     },
     "relax": {
       "type": "gif",
-      "src": "relax.gif",
+      "src": "relax_18b3cea1683b4df6_1afefc.gif",
       "pose": "relax_pose.png",
       "frames": [
         "relax_frame_1.png",
         "relax_frame_2.png",
         "relax_frame_3.png",
         "relax_frame_4.png"
-      ]
+      ],
+      "source": "wan_full_video",
+      "cache_bust": "18b3cea1683b4df6_1afefc"
     },
     "walk_right": {
       "type": "gif",
-      "src": "walk_right.gif",
+      "src": "walk_right_18b3d2d9330077ef_171de5.gif",
       "pose": "walk_right_pose.png",
       "frames": [
         "walk_right_frame_1.png",
         "walk_right_frame_2.png",
         "walk_right_frame_3.png",
         "walk_right_frame_4.png"
-      ]
+      ],
+      "source": "wan_full_video",
+      "cache_bust": "18b3d2d9330077ef_171de5"
     },
     "walk_left": {
       "type": "gif",
-      "src": "walk_left.gif",
+      "src": "walk_left_18b3d30f6118bd1f_171cea.gif",
       "pose": "walk_left_pose.png",
       "frames": [
         "walk_left_frame_1.png",
         "walk_left_frame_2.png",
         "walk_left_frame_3.png",
         "walk_left_frame_4.png"
-      ]
+      ],
+      "source": "wan_full_video_mirrored",
+      "cache_bust": "18b3d30f6118bd1f_171cea"
     },
     "sleep": {
       "type": "gif",
-      "src": "sleep_wan_fullvideo_1779963980.gif",
-      "source": "wan_full_video",
+      "src": "sleep_18b3d30f2fa815dc_14fc59.gif",
       "pose": "sleep_pose.png",
       "frames": [
         "sleep_frame_1.png",
         "sleep_frame_2.png",
         "sleep_frame_3.png",
         "sleep_frame_4.png"
-      ]
+      ],
+      "source": "wan_full_video",
+      "cache_bust": "18b3d30f2fa815dc_14fc59"
     }
   },
   "action_animation_map": {
@@ -109,5 +117,6 @@
     "walk_right": "walk_right",
     "walk_left": "walk_left",
     "sleep": "sleep"
-  }
+  },
+  "asset_version": "18b3d30f6118bd1f_171cea"
 }

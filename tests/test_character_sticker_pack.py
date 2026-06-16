@@ -40,11 +40,13 @@ class CharacterStickerPackTest(unittest.TestCase):
         self.assertIn("species-accurate locomotion reference", generate_image.call_args.kwargs["prompt"])
         self.assertIn("Do not preserve the reference image's sitting pose", generate_image.call_args.kwargs["prompt"])
         self.assertIn("Do not force an animal, octopus, slime, fish, or non-humanoid creature into a human standing pose", generate_image.call_args.kwargs["prompt"])
-        self.assertIn("If the character is an octopus or tentacled creature", generate_image.call_args.kwargs["prompt"])
-        self.assertIn("mollusk", generate_image.call_args.kwargs["prompt"])
-        self.assertIn("arms/tentacles crawl", generate_image.call_args.kwargs["prompt"])
-        self.assertIn("If the character is a fish", generate_image.call_args.kwargs["prompt"])
-        self.assertIn("tail-fin swimming", generate_image.call_args.kwargs["prompt"])
+        self.assertIn("If the character is an octopus, squid, fish", generate_image.call_args.kwargs["prompt"])
+        self.assertIn("marine or aquatic creature", generate_image.call_args.kwargs["prompt"])
+        self.assertIn("swimming-ready pose", generate_image.call_args.kwargs["prompt"])
+        self.assertIn("swimming drift", generate_image.call_args.kwargs["prompt"])
+        self.assertIn("fins, tail, tentacles, or body undulation", generate_image.call_args.kwargs["prompt"])
+        self.assertNotIn("arms/tentacles crawl", generate_image.call_args.kwargs["prompt"])
+        self.assertNotIn("touching the ground", generate_image.call_args.kwargs["prompt"])
         self.assertIn("Do not invent human legs", generate_image.call_args.kwargs["prompt"])
         self.assertIn("Transparent PNG only", generate_image.call_args.kwargs["prompt"])
 
@@ -249,7 +251,7 @@ class CharacterStickerPackTest(unittest.TestCase):
             self.assertIn("Swift window across the screen", call.kwargs["prompt"])
             self.assertIn("four frames total", call.kwargs["prompt"])
             self.assertIn("draw the character sitting", call.kwargs["prompt"])
-            self.assertIn("in-place stepping loop", call.kwargs["prompt"])
+            self.assertIn("in-place movement loop", call.kwargs["prompt"])
             self.assertNotIn("horizontal sprite-strip", call.kwargs["prompt"])
         self.assertIn("toward the left", generate_image.call_args_list[0].kwargs["prompt"])
         self.assertIn("back toward the center", generate_image.call_args_list[1].kwargs["prompt"])
@@ -259,6 +261,77 @@ class CharacterStickerPackTest(unittest.TestCase):
             "/static/desktop_pet_assets/character-1/manifest.json",
             result["desktop_pet_manifest_url"],
         )
+
+    def test_gpt_walk_frames_use_species_accurate_locomotion_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            static = root / "static"
+            generated = static / "generated"
+            generated.mkdir(parents=True)
+            source = generated / "avatar.png"
+            source_image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            for y in range(18, 46):
+                for x in range(18, 46):
+                    source_image.putpixel((x, y), (220, 80, 80, 255))
+            source_image.save(source)
+            store = root / "characters.json"
+            store.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "character-1",
+                            "image_url": "/static/generated/avatar.png",
+                            "style_mode": "animal_pixel_2d",
+                            "description": "蓝色章鱼",
+                            "created_at": "2026-05-21T00:00:00Z",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            def write_generated(name: str) -> None:
+                path = generated / name
+                image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                for y in range(20, 44):
+                    for x in range(20, 44):
+                        image.putpixel((x, y), (40, 120, 220, 255))
+                image.save(path)
+
+            generated_names = [f"walk-frame-{index}.png" for index in range(1, 5)]
+            for name in generated_names:
+                write_generated(name)
+
+            with (
+                patch.object(character_agent, "CHARACTER_STORE", store),
+                patch.object(character_agent, "STATIC_DIR", static),
+                patch("desktop_pet_assets.PROJECT_ROOT", root),
+                patch("desktop_pet_assets.STATIC_DIR", static),
+                patch("desktop_pet_assets.ASSET_ROOT", static / "desktop_pet_assets"),
+                patch.object(
+                    character_agent,
+                    "generate_image_from_reference",
+                    side_effect=generated_names,
+                ) as generate_image,
+            ):
+                character_agent.build_character_desktop_assets(
+                    "character-1",
+                    animation_names=["walk_right"],
+                    provider="gpt",
+                )
+
+        self.assertEqual(4, generate_image.call_count)
+        for call in generate_image.call_args_list:
+            prompt = call.kwargs["prompt"]
+            self.assertIn("species-accurate locomotion", prompt)
+            self.assertIn("octopus, squid, fish, jellyfish", prompt)
+            self.assertIn("swimming posture", prompt)
+            self.assertIn("swimming drift", prompt)
+            self.assertIn("tentacles, fins, tail, or body undulation", prompt)
+            self.assertIn("floating body", prompt)
+            self.assertNotIn("suction-cup contact", prompt)
+            self.assertNotIn("octopus crawling", prompt)
+            self.assertNotIn("one foot forward", prompt)
 
     def test_build_character_desktop_assets_uses_wan_provider_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

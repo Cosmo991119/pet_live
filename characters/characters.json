@@ -77,7 +77,7 @@
     "style_mode": "animal_pixel_2d",
     "description": "左边的小章鱼\n\n固定使用精致 Q 版二次元像素艺术画风；透明背景；无地面、无倒影、无投影、无场景。只转换上传图片的画风，保留主体、姿势、服装、颜色和手持物，不套用旧宠物或动物化设定。",
     "created_at": "2026-05-22T15:24:58Z",
-    "desktop_pet_manifest_url": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54/manifest.json",
+    "desktop_pet_manifest_url": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54/manifest.json?v=18b3d30f6118bd1f_171cea",
     "desktop_pet_asset_dir": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54",
     "desktop_pet_avatar_url": "/static/desktop_pet_assets/8bb2abb559984f83812153d08feede54/avatar.png",
     "published_animation_count": 5,
@@ -89,6 +89,6 @@
       "walk_right"
     ],
     "desktop_pet_asset_provider": "wan",
-    "walking_reference_image_url": "/static/generated/04df50041e0d4714b6562d02b21afff6.png"
+    "walking_reference_image_url": "/static/generated/a85886aa1855404fad4ccddde553d93c.png"
   }
 ]

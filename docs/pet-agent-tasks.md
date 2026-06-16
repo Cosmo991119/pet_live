@@ -1141,8 +1141,11 @@ Acceptance criteria:
   pet participants and preserve foreign-key checks.
 - [x] Support V1 memory types: `owner_shared`, `co_experienced`,
   `pet_milestone`, and `work_companion`.
-- [x] Store source, title, content, emotional tone, importance, visibility, and
-  metadata JSON.
+- [x] Store source, title, content, emotional tone, importance, visibility,
+  recall policy, use class, and metadata JSON.
+- [x] Support per-pet memory participant roles. V1 roles include
+  `participant`, `shared_with`, and `mentioned_only`, while preserving existing
+  internal roles such as `subject` and `helper`.
 - [x] `owner_shared` memories carry guidance that pets may recall the owner
   shared the moment, but must not claim physical presence.
 - [x] `co_experienced` memories carry guidance that only participant pets may
@@ -1188,13 +1191,22 @@ Acceptance criteria:
   flow is waiting for a reference image.
 - [x] A normal photo outside avatar customization creates a pending memory-photo
   flow instead of failing with an avatar setup hint.
-- [x] The pet asks the owner whether this was something they experienced
-  together and asks for the story before writing any memory.
+- [x] The pet asks neutrally what happened and which pets are in the memory
+  before writing any memory.
 - [x] A caption is stored as metadata but does not immediately write memory;
   the owner explanation after the photo drives memory creation.
 - [x] The next owner text is checked for shared-experience signals.
 - [x] Shared-experience text creates a `co_experienced` memory through
-  `POST /pet-memories`.
+  `POST /pet-memories` only when participant pets are named or confirmed.
+- [x] If shared-experience text does not name pets, the bot asks which pets
+  participated instead of defaulting to every pet in the home.
+- [x] Sensitive shared-experience text asks for explicit long-term memory
+  confirmation before saving.
+- [x] Confirmed sensitive photo memories are saved with `visibility=private`
+  and `recall_policy=owner_asked_only`.
+- [x] Owner cancel text such as "不要记住" clears the pending flow without
+  writing a memory.
+- [x] Pending photo-memory flows expire after a short window.
 - [x] Memory metadata keeps the Telegram photo file id, original message id,
   and caption if present.
 - [x] Non-matching explanation text clears the pending flow without writing a
@@ -1210,6 +1222,9 @@ Implementation notes:
 - V1 uses lightweight deterministic Chinese phrase checks for shared-experience
   detection. A later slice can replace or augment this with GPT classification
   once enough examples exist.
+- The current parser only handles a small deterministic first pass. Richer
+  mixed-role parsing for `shared_with` and `mentioned_only` in the same photo
+  explanation should be implemented before the Memory Album UI.
 
 ## Slice 43: Multi-Owner Foundation V1
 
@@ -1245,8 +1260,8 @@ Implementation notes:
   by itself enable multi-owner API scoping.
 - `TELEGRAM_ALLOWED_OWNER_CHAT_IDS` enables V1 owner scoping. Leave it empty for
   local single-user demo behavior.
-- Friendship invites, friendship messages, delivery budgets, and cross-owner
-  memory-sharing are still future slices built on this owner boundary.
+- Friendship invites, opportunistic friendship messages, owner-directed
+  forwarding, and confirmed memory sharing now build on this owner boundary.
 
 ## Slice 44: Pet Friendship Invites V1
 
@@ -1284,6 +1299,189 @@ Implementation notes:
   days by default.
 - Telegram V1 shares the command `/pet_friend_invite <token>` as the invitation
   handoff; a true Telegram deep link can be added later.
-- This slice creates the friendship graph only. Owner-directed sharing,
-  delivery budgets, mute/cooldown controls, and memory-share flows remain future
-  slices.
+- This slice creates the friendship graph. Slice 47 uses the accepted graph for
+  owner-directed forwarding, low-frequency daily messages, and confirmed memory
+  sharing.
+
+## Slice 45: Cross-Platform Desktop Companion Client
+
+Type: Desktop client / multi-owner remote companion
+
+Blocked by: Slice 43, Slice 44
+
+What to build:
+
+Make true floating desktop companionship available to owners who are not running
+the Telegram bot host machine. A Telegram bot cannot create a native floating
+window on another owner's computer by itself; the remote owner must run a local
+desktop client. The product direction is to provide an installable cross-platform
+desktop companion rather than asking users to configure a Python script.
+
+Technical decision:
+
+- Use Tauri as the preferred desktop client framework for the installable
+  companion.
+- Tauri is preferred over Electron for this use case because the companion should
+  be small, lightweight, always-on-top, and suitable for long-running desktop
+  presence.
+- The client should ship as normal installers/packages:
+  - macOS: `.app` / `.dmg`
+  - Windows: `.exe` / `.msi`
+  - Linux: `AppImage` / `.deb`
+- The client should support transparent, borderless, always-on-top windows,
+  local asset cache, tray/menu controls, and later deep links such as
+  `petagent://bind?...`.
+
+Acceptance criteria:
+
+- [ ] Telegram `桌面陪伴` distinguishes local-host launch from remote-owner
+  launch.
+- [ ] Remote owners receive a client download/bind flow instead of triggering
+  `launch_desktop_pet.py` on the bot host machine.
+- [ ] Server issues short-lived signed desktop bind tokens scoped to
+  `{owner_id, pet_id}`.
+- [ ] The desktop client can bind with a token, fetch only the bound pet config,
+  and download the pet's manifest/GIF assets from HTTPS URLs.
+- [ ] The client opens a native floating companion window on the owner's own
+  machine.
+- [ ] The client works on macOS, Windows, and Linux, or clearly reports platform
+  support gaps during phased rollout.
+- [ ] Tokens are not raw `owner_id` authorization; they are opaque/signed,
+  expire, and can be revoked or made one-time use.
+
+Implementation notes:
+
+- The current macOS Swift runtime remains a local-host implementation. It opens
+  the desktop pet on the machine running the bot and should not be treated as
+  remote-owner support.
+- A script-based prototype is acceptable for internal experiments, but the
+  product path is an installable Tauri client so non-technical owners do not need
+  to install Python dependencies or run terminal commands.
+- Before this slice ships, multi-owner safety should ensure `全部有素材的一起上桌面`
+  is owner-scoped or disabled for remote owners; the current runtime controller
+  uses unscoped `list_pets(...)` for the group launch path.
+
+## Slice 46: Telegram Proactive Virtual Pet Tick
+
+Type: Product behavior / Telegram companionship
+
+Blocked by: Slice 15, Slice 43
+
+What to build:
+
+Let virtual pets initiate Telegram updates without requiring the owner to press
+an action button or manually call `/tick`. The Telegram bot owns the chat-specific
+delivery loop; the backend remains responsible for ticking simulation state and
+generating event messages.
+
+Acceptance criteria:
+
+- [x] Telegram bot starts a background proactive tick loop when it runs.
+- [x] The loop targets `TELEGRAM_CHAT_ID`, allowed owner chats, and runtime
+  chats that have selected a pet.
+- [x] Each pass advances owner-scoped virtual pets through
+  `POST /virtual-pets/{pet_id}/tick`.
+- [x] Telegram bot calls tick with `notify=false` so backend global notifier
+  does not duplicate chat-specific delivery.
+- [x] Generated event messages are sent to the same owner chat.
+- [x] No Telegram message is sent when a tick produces no generated event
+  message.
+- [x] `.env.example` documents enable/disable and cadence settings.
+- [x] Tests cover notifier suppression and Telegram proactive delivery.
+
+Implementation notes:
+
+- Default cadence is every 600 seconds with `minutes=10`, so virtual time stays
+  close to wall-clock time.
+- `PET_AGENT_PROACTIVE_TICKS_ENABLED=false` disables the loop.
+- `PET_AGENT_PROACTIVE_TICK_INTERVAL_SECONDS` and
+  `PET_AGENT_PROACTIVE_TICK_MINUTES` tune runtime cadence.
+
+## Slice 47: Pet Friendship Messages and Memory Share V1
+
+Type: Cross-owner social messaging / Telegram UX
+
+Blocked by: Slice 44
+
+What to build:
+
+Use accepted pet friendships as the only delivery graph for cross-owner social
+messages. Owners can explicitly forward a message to a named friend owner, pets
+can send low-frequency daily friendship messages, and saved memories can be
+shared only after the source owner confirms.
+
+Acceptance criteria:
+
+- [x] Friendship list rows expose both owners' Telegram chat ids for delivery.
+- [x] Telegram handles `分享给XXX：...` by resolving `XXX` against the current
+  pet's active friendships and forwarding the text to that friend's owner chat.
+- [x] Telegram handles `分享记忆 9 给 XXX` by previewing the memory and requiring
+  `确认分享` before sending it to the friend owner.
+- [x] Explicit new memories may occasionally suggest a share command, with a
+  cooldown, but never send without confirmation.
+- [x] The bot opportunistically sends low-frequency daily friend messages from
+  active pet friendships, weighted by affinity and protected by per-friendship
+  cooldown.
+- [x] Tests cover cross-owner forwarding, memory-share confirmation, daily
+  friendship messages, and friendship delivery chat ids.
+
+Implementation notes:
+
+- V1 delivery is direct Telegram `sendMessage` to the friend owner's allowlisted
+  chat id; there is no durable outbox yet.
+- `PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS`,
+  `PET_FRIEND_DAILY_MESSAGE_COOLDOWN_SECONDS`,
+  `PET_FRIEND_DAILY_MESSAGE_CHANCE`, and
+  `PET_FRIEND_DAILY_MESSAGE_MAX_PER_SCAN` tune the automatic daily-message
+  budget.
+- `PET_FRIEND_MEMORY_SHARE_SUGGESTION_CHANCE` and
+  `PET_FRIEND_MEMORY_SHARE_SUGGESTION_COOLDOWN_SECONDS` tune how often new
+  memories suggest, but do not automatically perform, a friend share.
+- Memory sharing remains owner-consented: the owner must issue a share command
+  and then confirm the preview before the friend owner sees the memory content.
+
+## Slice 48: Simple Work-Form Lobster Tools V1
+
+Type: Work assistant / Telegram + desktop utility
+
+Blocked by: Slice 43
+
+What to build:
+
+Keep the first work-helper implementation deliberately small. The pet-avatar
+lobster can enter work form to help with lightweight local utilities, without
+turning into a broad productivity platform.
+
+Acceptance criteria:
+
+- [x] SQLite stores owner-scoped assistant items for `note`, `todo`, `alarm`,
+  and `focus`.
+- [x] FastAPI exposes create/list/complete endpoints for assistant items.
+- [x] Telegram persistent keyboard exposes `小助手`.
+- [x] Telegram accepts simple phrases such as `记一下 ...`, `待办 ...`,
+  `提醒 10分钟后 ...`, `闹钟 16:30 ...`, and `番茄钟 25 ...`.
+- [x] Telegram can list open notes/todos with `我的记事` / `我的待办`.
+- [x] Telegram can complete an item with `完成 7`.
+- [x] Telegram scans due `alarm` and `focus` items and sends a reminder back to
+  the owner chat, then dismisses the item to avoid repeated reminders.
+- [x] Native macOS desktop pet launcher passes API base URL, pet id, and owner
+  id into the Swift runtime.
+- [x] Floating desktop pet right-click menu can create note, todo, alarm, and
+  focus items through the same `POST /assistant/items` endpoint.
+- [x] Tests cover database persistence, API pass-through, command parsing, item
+  creation, due reminder delivery, desktop launch context, and desktop menu
+  wiring.
+
+Implementation notes:
+
+- This slice intentionally avoids calendar/email/deep project automation.
+- `assistant_items` stores the durable lightweight work-helper facts.
+- `PET_AGENT_ASSISTANT_DUE_SCAN_INTERVAL_SECONDS` controls Telegram due-item
+  scan cadence.
+- Entry principle: Telegram and the desktop pet should both be able to trigger
+  the same assistant functions. Telegram is the away-from-computer/chat entry;
+  the desktop pet is the immediate work-context entry.
+- Current V1 implements the Telegram entry, shared backend, and a native macOS
+  desktop right-click entry. Reminder delivery still happens through Telegram;
+  future desktop work should add local reminder bubbles/animation-state changes
+  for due items.

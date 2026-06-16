@@ -42,6 +42,15 @@ ALLOWED_MEMORY_SOURCES = {
     "assistant",
 }
 ALLOWED_MEMORY_VISIBILITIES = {"home", "private"}
+ALLOWED_MEMORY_USE_CLASSES = {"recallable", "behavioral", "private"}
+ALLOWED_MEMORY_RECALL_POLICIES = {"normal", "owner_asked_only"}
+ALLOWED_MEMORY_PARTICIPANT_ROLES = {
+    "participant",
+    "shared_with",
+    "mentioned_only",
+    "subject",
+    "helper",
+}
 MEMORY_PARTICIPANT_ROLES = {
     "owner_shared": "shared_with",
     "co_experienced": "participant",
@@ -64,6 +73,9 @@ MEMORY_RECALL_GUIDANCE = {
         "Recall as a work-help moment; avoid storing or repeating secrets."
     ),
 }
+ALLOWED_ASSISTANT_ITEM_TYPES = {"note", "todo", "alarm", "focus"}
+ALLOWED_ASSISTANT_ITEM_STATUSES = {"open", "done", "dismissed"}
+ALLOWED_ASSISTANT_ITEM_SOURCES = {"manual", "telegram", "desktop", "assistant"}
 CONFIDENCE_NOTIFY_THRESHOLD = 0.7
 RAW_EVENT_RETENTION_DAYS = 90
 SESSION_WINDOWS_SECONDS = {
@@ -227,6 +239,57 @@ def _migrate_play_behavior(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_behavior_sessions_pet_behavior_time
         ON behavior_sessions (pet_id, behavior, start_time, end_time);
+        """
+    )
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_memory_participant_roles(conn: sqlite3.Connection) -> None:
+    """Upgrade older databases whose participant role CHECK omits mentioned_only."""
+    participant_sql = _table_sql(conn, "pet_memory_participants")
+    if not participant_sql or "'mentioned_only'" in participant_sql:
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.executescript(
+        """
+        ALTER TABLE pet_memory_participants RENAME TO pet_memory_participants_old;
+
+        CREATE TABLE pet_memory_participants (
+            memory_id INTEGER NOT NULL,
+            pet_id INTEGER NOT NULL,
+            role TEXT NOT NULL CHECK (
+                role IN (
+                    'shared_with',
+                    'participant',
+                    'mentioned_only',
+                    'subject',
+                    'helper'
+                )
+            ),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (memory_id, pet_id),
+            FOREIGN KEY (memory_id) REFERENCES pet_memories(id) ON DELETE CASCADE,
+            FOREIGN KEY (pet_id) REFERENCES pets(id)
+        );
+
+        INSERT INTO pet_memory_participants (
+            memory_id,
+            pet_id,
+            role,
+            created_at
+        )
+        SELECT
+            memory_id,
+            pet_id,
+            role,
+            created_at
+        FROM pet_memory_participants_old;
+
+        DROP TABLE pet_memory_participants_old;
+
+        CREATE INDEX IF NOT EXISTS idx_pet_memory_participants_pet
+        ON pet_memory_participants (pet_id, memory_id);
         """
     )
     conn.execute("PRAGMA foreign_keys = ON")
@@ -413,6 +476,38 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
                 FOREIGN KEY (pet_id) REFERENCES pets(id)
             );
 
+            CREATE TABLE IF NOT EXISTS assistant_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                pet_id INTEGER,
+                item_type TEXT NOT NULL CHECK (
+                    item_type IN ('note', 'todo', 'alarm', 'focus')
+                ),
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                due_at TEXT,
+                duration_minutes INTEGER CHECK (
+                    duration_minutes IS NULL OR duration_minutes > 0
+                ),
+                status TEXT NOT NULL DEFAULT 'open' CHECK (
+                    status IN ('open', 'done', 'dismissed')
+                ),
+                source TEXT NOT NULL DEFAULT 'manual' CHECK (
+                    source IN ('manual', 'telegram', 'desktop', 'assistant')
+                ),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                FOREIGN KEY (owner_id) REFERENCES owners(id),
+                FOREIGN KEY (pet_id) REFERENCES pets(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_assistant_items_owner_status_due
+            ON assistant_items (owner_id, status, due_at);
+
+            CREATE INDEX IF NOT EXISTS idx_assistant_items_owner_type_created
+            ON assistant_items (owner_id, item_type, created_at);
+
             CREATE TABLE IF NOT EXISTS pet_relationships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_pet_id INTEGER NOT NULL,
@@ -513,6 +608,12 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
                 visibility TEXT NOT NULL DEFAULT 'home' CHECK (
                     visibility IN ('home', 'private')
                 ),
+                use_class TEXT NOT NULL DEFAULT 'recallable' CHECK (
+                    use_class IN ('recallable', 'behavioral', 'private')
+                ),
+                recall_policy TEXT NOT NULL DEFAULT 'normal' CHECK (
+                    recall_policy IN ('normal', 'owner_asked_only')
+                ),
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -525,7 +626,13 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
                 memory_id INTEGER NOT NULL,
                 pet_id INTEGER NOT NULL,
                 role TEXT NOT NULL CHECK (
-                    role IN ('shared_with', 'participant', 'subject', 'helper')
+                    role IN (
+                        'shared_with',
+                        'participant',
+                        'mentioned_only',
+                        'subject',
+                        'helper'
+                    )
                 ),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (memory_id, pet_id),
@@ -543,8 +650,17 @@ def init_db(db_path: DbPath = DB_PATH) -> Path:
             )
         if not _column_exists(conn, "pets", "owner_id"):
             conn.execute("ALTER TABLE pets ADD COLUMN owner_id INTEGER")
+        if not _column_exists(conn, "pet_memories", "use_class"):
+            conn.execute(
+                "ALTER TABLE pet_memories ADD COLUMN use_class TEXT NOT NULL DEFAULT 'recallable'"
+            )
+        if not _column_exists(conn, "pet_memories", "recall_policy"):
+            conn.execute(
+                "ALTER TABLE pet_memories ADD COLUMN recall_policy TEXT NOT NULL DEFAULT 'normal'"
+            )
         _assign_existing_pets_to_default_owner(conn)
         _migrate_play_behavior(conn)
+        _migrate_memory_participant_roles(conn)
     return db_path
 
 
@@ -852,6 +968,7 @@ def delete_pet(
         conn.execute("DELETE FROM sleep_sessions WHERE pet_id = ?", (pet_id,))
         conn.execute("DELETE FROM behavior_sessions WHERE pet_id = ?", (pet_id,))
         conn.execute("DELETE FROM virtual_pet_states WHERE pet_id = ?", (pet_id,))
+        conn.execute("UPDATE assistant_items SET pet_id = NULL WHERE pet_id = ?", (pet_id,))
         conn.execute(
             "DELETE FROM pet_relationships WHERE from_pet_id = ? OR to_pet_id = ?",
             (pet_id, pet_id),
@@ -882,6 +999,193 @@ def delete_pet(
         conn.execute("DELETE FROM pets WHERE id = ?", (pet_id,))
 
     return pet
+
+
+def _normalize_assistant_item_type(item_type: str) -> str:
+    value = str(item_type or "").strip()
+    if value not in ALLOWED_ASSISTANT_ITEM_TYPES:
+        raise ValueError(f"item_type must be one of {sorted(ALLOWED_ASSISTANT_ITEM_TYPES)}")
+    return value
+
+
+def _normalize_assistant_item_status(status: str) -> str:
+    value = str(status or "").strip()
+    if value not in ALLOWED_ASSISTANT_ITEM_STATUSES:
+        raise ValueError(f"status must be one of {sorted(ALLOWED_ASSISTANT_ITEM_STATUSES)}")
+    return value
+
+
+def _normalize_assistant_item_source(source: str) -> str:
+    value = str(source or "manual").strip()
+    if value not in ALLOWED_ASSISTANT_ITEM_SOURCES:
+        raise ValueError(f"source must be one of {sorted(ALLOWED_ASSISTANT_ITEM_SOURCES)}")
+    return value
+
+
+def _validate_optional_iso_datetime(value: Optional[str], field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    try:
+        datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO datetime") from exc
+    return normalized
+
+
+def _assistant_item_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return _row_to_dict(row)
+
+
+def create_assistant_item(
+    item_type: str,
+    title: str,
+    body: str = "",
+    due_at: Optional[str] = None,
+    duration_minutes: Optional[int] = None,
+    status: str = "open",
+    source: str = "manual",
+    owner_id: Optional[int] = None,
+    pet_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Create a small owner-scoped assistant item such as a note, todo, or alarm."""
+    normalized_type = _normalize_assistant_item_type(item_type)
+    normalized_status = _normalize_assistant_item_status(status)
+    normalized_source = _normalize_assistant_item_source(source)
+    title = str(title or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    body = str(body or "").strip()
+    normalized_due_at = _validate_optional_iso_datetime(due_at, "due_at")
+    if duration_minutes is not None and int(duration_minutes) <= 0:
+        raise ValueError("duration_minutes must be positive")
+
+    with connect(db_path) as conn:
+        resolved_owner_id = _resolve_owner_id(conn, owner_id)
+        if pet_id is not None:
+            pet_owner_id = _pet_owner_id(conn, int(pet_id), "pet_id")
+            if pet_owner_id != resolved_owner_id:
+                raise ValueError("pet_id does not belong to owner_id")
+        cursor = conn.execute(
+            """
+            INSERT INTO assistant_items (
+                owner_id,
+                pet_id,
+                item_type,
+                title,
+                body,
+                due_at,
+                duration_minutes,
+                status,
+                source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                resolved_owner_id,
+                pet_id,
+                normalized_type,
+                title,
+                body,
+                normalized_due_at,
+                int(duration_minutes) if duration_minutes is not None else None,
+                normalized_status,
+                normalized_source,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM assistant_items WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+    return _assistant_item_row_to_dict(row)
+
+
+def list_assistant_items(
+    owner_id: Optional[int] = None,
+    item_type: Optional[str] = None,
+    status: Optional[str] = "open",
+    due_before: Optional[str] = None,
+    limit: int = 20,
+    db_path: DbPath = DB_PATH,
+) -> list[dict[str, Any]]:
+    """List assistant items, optionally filtered by owner, type, status, or due time."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if owner_id is not None:
+        clauses.append("owner_id = ?")
+        params.append(int(owner_id))
+    if item_type is not None:
+        clauses.append("item_type = ?")
+        params.append(_normalize_assistant_item_type(item_type))
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(_normalize_assistant_item_status(status))
+    if due_before is not None:
+        clauses.append("due_at IS NOT NULL")
+        clauses.append("due_at <= ?")
+        params.append(_validate_optional_iso_datetime(due_before, "due_before"))
+
+    limit = max(1, min(100, int(limit)))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM assistant_items
+            {where}
+            ORDER BY
+                CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
+                due_at ASC,
+                created_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return [_assistant_item_row_to_dict(row) for row in rows]
+
+
+def complete_assistant_item(
+    item_id: int,
+    owner_id: Optional[int] = None,
+    status: str = "done",
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Mark one assistant item as done or dismissed and return the updated row."""
+    normalized_status = _normalize_assistant_item_status(status)
+    if normalized_status == "open":
+        raise ValueError("complete status must be done or dismissed")
+    clauses = ["id = ?"]
+    params: list[Any] = [int(item_id)]
+    if owner_id is not None:
+        clauses.append("owner_id = ?")
+        params.append(int(owner_id))
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            f"SELECT * FROM assistant_items WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"assistant item {item_id} does not exist")
+        conn.execute(
+            """
+            UPDATE assistant_items
+            SET status = ?,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (normalized_status, int(item_id)),
+        )
+        updated = conn.execute(
+            "SELECT * FROM assistant_items WHERE id = ?",
+            (int(item_id),),
+        ).fetchone()
+    return _assistant_item_row_to_dict(updated)
 
 
 def upsert_pet_relationship(
@@ -1116,6 +1420,8 @@ def _friendship_select_sql(where_sql: str = "") -> str:
             pb.name AS pet_b_name,
             oa.display_name AS owner_a_name,
             ob.display_name AS owner_b_name,
+            oa.telegram_chat_id AS owner_a_chat_id,
+            ob.telegram_chat_id AS owner_b_chat_id,
             i.status AS invite_status
         FROM pet_friendships f
         JOIN pets pa ON pa.id = f.pet_a_id
@@ -1255,6 +1561,56 @@ def _normalize_memory_visibility(visibility: str) -> str:
     return value
 
 
+def _normalize_memory_use_class(use_class: str) -> str:
+    value = str(use_class or "recallable").strip() or "recallable"
+    if value not in ALLOWED_MEMORY_USE_CLASSES:
+        raise ValueError(
+            f"use_class must be one of {sorted(ALLOWED_MEMORY_USE_CLASSES)}"
+        )
+    return value
+
+
+def _normalize_memory_recall_policy(recall_policy: str) -> str:
+    value = str(recall_policy or "normal").strip() or "normal"
+    if value not in ALLOWED_MEMORY_RECALL_POLICIES:
+        raise ValueError(
+            f"recall_policy must be one of {sorted(ALLOWED_MEMORY_RECALL_POLICIES)}"
+        )
+    return value
+
+
+def _normalize_memory_participant_role(role: str) -> str:
+    value = str(role or "").strip()
+    if value not in ALLOWED_MEMORY_PARTICIPANT_ROLES:
+        raise ValueError(
+            f"participant role must be one of {sorted(ALLOWED_MEMORY_PARTICIPANT_ROLES)}"
+        )
+    return value
+
+
+def _normalize_memory_participants(
+    memory_type: str,
+    participant_pet_ids: list[int],
+    participants: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    if participants:
+        for participant in participants:
+            pet_id = int(participant["pet_id"])
+            role = _normalize_memory_participant_role(str(participant.get("role") or ""))
+            if pet_id in seen:
+                continue
+            seen.add(pet_id)
+            normalized.append({"pet_id": pet_id, "role": role})
+        return normalized
+
+    default_role = MEMORY_PARTICIPANT_ROLES[memory_type]
+    for pet_id in _normalize_pet_ids(participant_pet_ids):
+        normalized.append({"pet_id": pet_id, "role": default_role})
+    return normalized
+
+
 def _normalize_pet_ids(pet_ids: list[int]) -> list[int]:
     normalized: list[int] = []
     for pet_id in pet_ids:
@@ -1314,6 +1670,9 @@ def create_pet_memory(
     emotional_tone: str = "",
     importance: int = 3,
     visibility: str = "home",
+    use_class: str = "recallable",
+    recall_policy: str = "normal",
+    participants: Optional[list[dict[str, Any]]] = None,
     metadata: Optional[dict[str, Any]] = None,
     db_path: DbPath = DB_PATH,
 ) -> dict[str, Any]:
@@ -1321,22 +1680,26 @@ def create_pet_memory(
     memory_type = _normalize_memory_type(memory_type)
     source = _normalize_memory_source(source)
     visibility = _normalize_memory_visibility(visibility)
+    use_class = _normalize_memory_use_class(use_class)
+    recall_policy = _normalize_memory_recall_policy(recall_policy)
     content = str(content or "").strip()
     if not content:
         raise ValueError("content is required")
     if importance < 1 or importance > 5:
         raise ValueError("importance must be between 1 and 5")
 
-    participant_pet_ids = _normalize_pet_ids(participant_pet_ids)
-    if not participant_pet_ids:
-        raise ValueError("participant_pet_ids must include at least one pet")
-
-    role = MEMORY_PARTICIPANT_ROLES[memory_type]
+    normalized_participants = _normalize_memory_participants(
+        memory_type,
+        participant_pet_ids,
+        participants,
+    )
+    if not normalized_participants:
+        raise ValueError("participants must include at least one pet")
     metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
 
     with connect(db_path) as conn:
-        for pet_id in participant_pet_ids:
-            _ensure_pet_exists(conn, pet_id, "participant_pet_id")
+        for participant in normalized_participants:
+            _ensure_pet_exists(conn, participant["pet_id"], "participant_pet_id")
 
         cursor = conn.execute(
             """
@@ -1348,10 +1711,12 @@ def create_pet_memory(
                 emotional_tone,
                 importance,
                 visibility,
+                use_class,
+                recall_policy,
                 metadata_json,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 memory_type,
@@ -1361,6 +1726,8 @@ def create_pet_memory(
                 str(emotional_tone or "").strip(),
                 importance,
                 visibility,
+                use_class,
+                recall_policy,
                 metadata_json,
             ),
         )
@@ -1370,7 +1737,10 @@ def create_pet_memory(
             INSERT INTO pet_memory_participants (memory_id, pet_id, role)
             VALUES (?, ?, ?)
             """,
-            [(memory_id, pet_id, role) for pet_id in participant_pet_ids],
+            [
+                (memory_id, participant["pet_id"], participant["role"])
+                for participant in normalized_participants
+            ],
         )
         memory = _fetch_pet_memory(conn, memory_id)
     if memory is None:
@@ -1387,10 +1757,38 @@ def get_pet_memory(
         return _fetch_pet_memory(conn, memory_id)
 
 
+def delete_pet_memory(
+    memory_id: int,
+    owner_id: Optional[int] = None,
+    db_path: DbPath = DB_PATH,
+) -> dict[str, Any]:
+    """Hard-delete one durable pet memory."""
+    with connect(db_path) as conn:
+        memory = _fetch_pet_memory(conn, memory_id)
+        if memory is None:
+            raise ValueError("pet memory does not exist")
+        if owner_id is not None:
+            resolved_owner_id = _resolve_owner_id(conn, owner_id)
+            owned_participant = conn.execute(
+                """
+                SELECT 1
+                FROM pet_memory_participants mp
+                JOIN pets p ON p.id = mp.pet_id
+                WHERE mp.memory_id = ? AND p.owner_id = ?
+                """,
+                (memory_id, resolved_owner_id),
+            ).fetchone()
+            if owned_participant is None:
+                raise ValueError("pet memory does not belong to owner_id")
+        conn.execute("DELETE FROM pet_memories WHERE id = ?", (memory_id,))
+    return memory
+
+
 def list_pet_memories(
     pet_id: Optional[int] = None,
     memory_type: Optional[str] = None,
     visibility: Optional[str] = None,
+    owner_id: Optional[int] = None,
     limit: int = 20,
     db_path: DbPath = DB_PATH,
 ) -> list[dict[str, Any]]:
@@ -1416,6 +1814,18 @@ def list_pet_memories(
             """
         )
         params.append(pet_id)
+    if owner_id is not None:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM pet_memory_participants mp_owner
+                JOIN pets p_owner ON p_owner.id = mp_owner.pet_id
+                WHERE mp_owner.memory_id = m.id AND p_owner.owner_id = ?
+            )
+            """
+        )
+        params.append(owner_id)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)
 

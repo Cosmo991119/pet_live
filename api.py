@@ -25,16 +25,20 @@ from image_style_agent import transform_image_style
 from notifier import notifier_from_env
 from pet_db import (
     accept_pet_friendship_invite,
+    complete_assistant_item,
+    create_assistant_item,
     create_owner_for_telegram_chat,
     create_pet_friendship_invite,
     create_pet_memory,
     create_pet,
     delete_pet,
+    delete_pet_memory,
     delete_pet_relationship,
     get_pet,
     get_pet_friendship_invite,
     get_pet_stats,
     init_db,
+    list_assistant_items,
     list_pet_memories,
     list_pet_friendships,
     list_pet_relationships,
@@ -98,11 +102,14 @@ class PetMemoryRequest(BaseModel):
     memory_type: str
     content: str
     participant_pet_ids: list[int] = Field(default_factory=list)
+    participants: list[dict[str, Any]] = Field(default_factory=list)
     title: str = ""
     source: str = "manual"
     emotional_tone: str = ""
     importance: int = Field(default=3, ge=1, le=5)
     visibility: str = "home"
+    use_class: str = "recallable"
+    recall_policy: str = "normal"
     metadata: Optional[dict[str, Any]] = None
 
 
@@ -132,6 +139,22 @@ class VirtualPetActionRequest(BaseModel):
 class WorkAssistRequest(BaseModel):
     mode: str = "summarize"
     text: str
+
+
+class AssistantItemRequest(BaseModel):
+    owner_id: Optional[int] = None
+    pet_id: Optional[int] = None
+    item_type: str
+    title: str
+    body: str = ""
+    due_at: Optional[str] = None
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    source: str = "assistant"
+
+
+class AssistantItemCompleteRequest(BaseModel):
+    owner_id: Optional[int] = None
+    status: str = "done"
 
 
 class ImageStyleResponse(BaseModel):
@@ -200,6 +223,7 @@ def startup() -> None:
 @app.get("/")
 def root() -> RedirectResponse:
     return RedirectResponse(url="/static/index.html")
+
 
 
 @app.get("/pets")
@@ -360,6 +384,7 @@ def list_pet_memories_endpoint(
     pet_id: Optional[int] = None,
     memory_type: Optional[str] = None,
     visibility: Optional[str] = None,
+    owner_id: Optional[int] = None,
     limit: int = 20,
 ) -> list[dict]:
     try:
@@ -367,6 +392,7 @@ def list_pet_memories_endpoint(
             pet_id=pet_id,
             memory_type=memory_type,
             visibility=visibility,
+            owner_id=owner_id,
             limit=limit,
         )
     except ValueError as exc:
@@ -384,11 +410,22 @@ def create_pet_memory_endpoint(payload: PetMemoryRequest) -> dict:
             emotional_tone=payload.emotional_tone,
             importance=payload.importance,
             visibility=payload.visibility,
+            use_class=payload.use_class,
+            recall_policy=payload.recall_policy,
             participant_pet_ids=payload.participant_pet_ids,
+            participants=payload.participants,
             metadata=payload.metadata,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/pet-memories/{memory_id}")
+def delete_pet_memory_endpoint(memory_id: int, owner_id: Optional[int] = None) -> dict:
+    try:
+        return delete_pet_memory(memory_id, owner_id=owner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.get("/image-styles", response_model=list[ImageStyleOption])
@@ -518,6 +555,7 @@ def tick_virtual_pet_endpoint(
     pet_id: int,
     payload: VirtualPetTickRequest,
     owner_id: Optional[int] = None,
+    notify: bool = True,
 ) -> dict:
     try:
         if owner_id is not None and get_pet(pet_id, owner_id=owner_id) is None:
@@ -525,7 +563,7 @@ def tick_virtual_pet_endpoint(
         return tick_virtual_pet(
             pet_id=pet_id,
             minutes=payload.minutes,
-            notifier=notifier_from_env(),
+            notifier=notifier_from_env() if notify else None,
             use_llm=os.getenv("PET_AGENT_USE_LLM", "false").lower() == "true",
         )
     except ValueError as exc:
@@ -557,3 +595,56 @@ def assist_text_endpoint(payload: WorkAssistRequest) -> dict:
         return assist_with_text(mode=payload.mode, text=payload.text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/assistant/items")
+def create_assistant_item_endpoint(payload: AssistantItemRequest) -> dict:
+    try:
+        return create_assistant_item(
+            owner_id=payload.owner_id,
+            pet_id=payload.pet_id,
+            item_type=payload.item_type,
+            title=payload.title,
+            body=payload.body,
+            due_at=payload.due_at,
+            duration_minutes=payload.duration_minutes,
+            source=payload.source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/assistant/items")
+def list_assistant_items_endpoint(
+    owner_id: Optional[int] = None,
+    item_type: Optional[str] = None,
+    status: Optional[str] = "open",
+    due_before: Optional[str] = None,
+    limit: int = 20,
+) -> list[dict]:
+    try:
+        return list_assistant_items(
+            owner_id=owner_id,
+            item_type=item_type,
+            status=status,
+            due_before=due_before,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.patch("/assistant/items/{item_id}/complete")
+def complete_assistant_item_endpoint(
+    item_id: int,
+    payload: AssistantItemCompleteRequest,
+) -> dict:
+    try:
+        return complete_assistant_item(
+            item_id,
+            owner_id=payload.owner_id,
+            status=payload.status,
+        )
+    except ValueError as exc:
+        status_code = 404 if "does not exist" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))

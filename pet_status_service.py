@@ -7,6 +7,8 @@ kept separate from Telegram so desktop and other clients can reuse it later.
 
 from typing import Any
 
+from pet_message_agent import format_speaker_labeled_message
+
 
 def _bar(value: float) -> str:
     filled = max(0, min(5, round(value / 20)))
@@ -76,7 +78,7 @@ def format_action_reply(
     state = snapshot["state"]
 
     if generated_message:
-        return generated_message
+        return format_speaker_labeled_message(generated_message, pet_name)
 
     templates = {
         "feed": {
@@ -122,5 +124,8 @@ def format_action_reply(
         f"{call_name}，{pet_name}收到你的照顾啦。",
     )
     if bool(state.get("is_sleeping", False)):
-        return f"{message}\n现在我有点困，想窝着休息一会儿。"
-    return message
+        return format_speaker_labeled_message(
+            f"{message}\n现在我有点困，想窝着休息一会儿。",
+            pet_name,
+        )
+    return format_speaker_labeled_message(message, pet_name)

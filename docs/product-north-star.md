@@ -9,11 +9,17 @@ visible, animated, customizable, emotionally familiar, and useful. The pet is
 not just a chat persona and not just a behavior notification system. It is the
 user's embodied AI tool interface.
 
+The work assistant should not feel like a second generic productivity bot added
+beside the pet. It is the owner's own pet avatar entering a work form. In the
+current product language, the lobster is still the same companion: the same
+identity, relationship, memories, and visual continuity, but with a work posture
+and access to structured tools.
+
 ## One-Line Pitch
 
 ```text
 A desktop AI pet that moves, remembers shared moments with its owner, and helps
-with work through an approachable companion interface.
+with work through the owner's own pet-avatar form.
 ```
 
 ## Product Pillars
@@ -74,7 +80,11 @@ memories from transient logs.
 
 ### 4. Embodied AI Tool Helper
 
-The pet should help the owner work through tools, not only conversation.
+The pet should help the owner work through tools, not only conversation. Work
+help is a mode change for the pet, not a separate assistant persona. When the
+owner asks for help, the pet can become a work-form lobster: same companion,
+same memories, same relationship, now holding the tools needed for the current
+task.
 
 Possible first work-assistant abilities:
 
@@ -88,6 +98,11 @@ Possible first work-assistant abilities:
 
 The user experience should make the pet feel like the helper, while the system
 keeps tool execution structured and auditable.
+
+This mode should preserve emotional continuity. Work sessions can become part of
+the shared memory timeline, such as "the lobster helped the owner finish a PR
+summary" or "the lobster kept the owner company through a focused writing
+session," while secrets and raw work content remain protected by memory policy.
 
 ### 5. Everyday Telegram Window
 

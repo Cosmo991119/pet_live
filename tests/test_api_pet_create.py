@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from api import (
     CharacterStickerPackRequest,
+    VirtualPetTickRequest,
     PetFriendshipInviteAcceptRequest,
     PetFriendshipInviteCreateRequest,
     PetCreateRequest,
@@ -17,12 +18,14 @@ from api import (
     create_pet_endpoint,
     create_pet_memory_endpoint,
     create_telegram_owner_endpoint,
+    delete_pet_memory_endpoint,
     delete_pet_endpoint,
     delete_pet_relationship_endpoint,
     list_pet_memories_endpoint,
     list_pet_friendships_endpoint,
     list_pet_relationships_endpoint,
     mute_pet_relationship_endpoint,
+    tick_virtual_pet_endpoint,
     upsert_pet_relationship_endpoint,
 )
 
@@ -65,6 +68,25 @@ class ApiPetCreateTest(unittest.TestCase):
             telegram_chat_id="chat-1",
             display_name="小明",
         )
+
+    @patch("api.notifier_from_env")
+    @patch("api.tick_virtual_pet")
+    def test_virtual_pet_tick_endpoint_can_suppress_backend_notifier(
+        self,
+        tick_virtual_pet,
+        notifier_from_env,
+    ) -> None:
+        tick_virtual_pet.return_value = {"pet_id": 7, "event_result": None}
+
+        result = tick_virtual_pet_endpoint(
+            7,
+            VirtualPetTickRequest(minutes=10),
+            notify=False,
+        )
+
+        self.assertEqual({"pet_id": 7, "event_result": None}, result)
+        notifier_from_env.assert_not_called()
+        self.assertIsNone(tick_virtual_pet.call_args.kwargs["notifier"])
 
     @patch("api.build_character_desktop_assets")
     def test_character_desktop_assets_passes_requested_animations(self, build_assets) -> None:
@@ -211,7 +233,10 @@ class ApiPetCreateTest(unittest.TestCase):
             emotional_tone="warm",
             importance=4,
             visibility="home",
+            use_class="recallable",
+            recall_policy="owner_asked_only",
             participant_pet_ids=[1, 2],
+            participants=[{"pet_id": 1, "role": "shared_with"}],
             metadata={"telegram_message_id": 123},
         )
 
@@ -229,9 +254,21 @@ class ApiPetCreateTest(unittest.TestCase):
             emotional_tone="warm",
             importance=4,
             visibility="home",
+            use_class="recallable",
+            recall_policy="owner_asked_only",
             participant_pet_ids=[1, 2],
+            participants=[{"pet_id": 1, "role": "shared_with"}],
             metadata={"telegram_message_id": 123},
         )
+
+    @patch("api.delete_pet_memory")
+    def test_delete_pet_memory_endpoint_returns_deleted_memory(self, delete_memory) -> None:
+        delete_memory.return_value = {"id": 9, "title": "称呼偏好"}
+
+        result = delete_pet_memory_endpoint(9, owner_id=3)
+
+        self.assertEqual({"id": 9, "title": "称呼偏好"}, result)
+        delete_memory.assert_called_once_with(9, owner_id=3)
 
     @patch("api.list_pet_memories")
     def test_list_pet_memories_endpoint_passes_filters(self, list_memories) -> None:
@@ -241,6 +278,7 @@ class ApiPetCreateTest(unittest.TestCase):
             pet_id=1,
             memory_type="co_experienced",
             visibility="home",
+            owner_id=3,
             limit=8,
         )
 
@@ -249,6 +287,7 @@ class ApiPetCreateTest(unittest.TestCase):
             pet_id=1,
             memory_type="co_experienced",
             visibility="home",
+            owner_id=3,
             limit=8,
         )
 

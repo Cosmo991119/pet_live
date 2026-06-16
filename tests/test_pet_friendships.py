@@ -54,6 +54,8 @@ class PetFriendshipTest(unittest.TestCase):
             self.assertEqual(50, friendship["affinity"])
             self.assertEqual(heimi["id"], friendship["pet_a_id"])
             self.assertEqual(qingqing["id"], friendship["pet_b_id"])
+            self.assertEqual("chat-a", friendship["owner_a_chat_id"])
+            self.assertEqual("chat-b", friendship["owner_b_chat_id"])
             self.assertEqual(
                 [friendship["id"]],
                 [item["id"] for item in list_pet_friendships(owner_id=first_owner["id"], db_path=db_path)],

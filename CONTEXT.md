@@ -2,6 +2,24 @@
 
 ## Glossary
 
+### Bead Pattern Sheet
+
+A maker-facing pixel grid for placing fuse beads. It is not just a preview of
+pixel art: it must include row and column coordinates, visible grid lines,
+stronger guide lines at regular intervals, per-cell palette codes when space
+allows, and a legend that lists each used color with bead counts.
+
+For the current web tool, the sheet is generated from a styled image by sampling
+it into a configurable grid, mapping each cell to a bead palette color, and
+letting the user edit individual cells before downloading a PNG sheet.
+
+### Mard Bead Palette
+
+The color source for the first bead-pattern tool. The active implementation uses
+the publicly documented Mard v1 221-color chart and maps image pixels to the
+nearest available Mard HEX color. Treat 291-color or other Mard variants as
+future selectable palettes, not as the current default.
+
 ### Pet Memory
 
 A durable companionship memory that can later be recalled by pets in Telegram,
@@ -194,6 +212,178 @@ in ordinary nostalgic callbacks, casual group-chat reactions, desktop bubbles,
 or routine daily and weekly summaries by default. They may be recalled when the
 owner explicitly asks about the topic, or if the owner later opts into a more
 active recall mode for that memory category.
+
+Memory visibility and recall policy should be modeled separately. `visibility`
+answers who can inspect or receive the memory, such as `home` or `private`.
+`recall_policy` answers whether pets may proactively bring it up, such as
+`normal` or `owner_asked_only`. `importance` answers how meaningful the memory
+is; it must not be used as a proxy for recall permission.
+
+`owner_asked_only` recall should require a clear owner reference to the specific
+memory or a very close identifier, such as the remembered event, photo, or
+participant. Broad adjacent statements, such as "I have not slept well lately",
+or generic prompts like "tell me an old memory", should not unlock sensitive
+owner-asked-only memories. Those broad prompts should use non-sensitive
+memories unless the owner narrows the request.
+
+When asking whether to save a sensitive memory, the default confirmation choices
+should be restricted. The primary save choice should be equivalent to "remember
+this, but only bring it up when I ask"; the other choice should decline durable
+storage. The product should not offer proactive sensitive recall as the default
+confirmation path. More active recall can be enabled later from memory or album
+settings if the owner explicitly wants it.
+
+Ordinary non-sensitive memories still need low-frequency recall controls. A new
+memory may be naturally mentioned once in the next day or two, but should then
+cool down unless the owner asks about it. The same memory should not appear
+repeatedly across Telegram chat, desktop bubbles, and summaries in a short
+period. Higher importance can increase recall eligibility, but should not bypass
+cooldown rules.
+
+Memory edits should affect recall cooldown based on semantic significance. A
+minor typo or wording fix should not reset cooldown. A meaningful change to
+participants, memory type, importance, recall policy, or the core remembered
+description may reset or partially reset recall eligibility. Sensitive memories
+remain bound by `owner_asked_only` or their configured recall policy even after
+editing.
+
+Owner deletion of a memory should be semantically hard deletion in V1. Deleted
+memory text, participant links, recall eligibility, and photo source references
+should no longer be available to pets or album views. If future album images are
+persisted locally, deletion should remove them or mark them for cleanup. The
+system may retain minimal non-content operational logs that a deletion occurred,
+but should not retain readable deleted memory content for product recall.
+
+The owner may later upgrade a Shared Owner Memory into a Co-Experienced Pet
+Memory because co-experience is an owner-authorized companionship narrative.
+The upgrade must explicitly choose participating pets, replace the previous
+shared-only recall boundary for those pets, and avoid granting lived-experience
+recall to unselected pets. If the memory content is sensitive, the sensitive
+memory confirmation and restricted recall rules still apply.
+
+The owner may also downgrade a Co-Experienced Pet Memory into a Shared Owner
+Memory. After downgrade, pets must stop recalling the moment as lived
+experience; selected pets may only say the owner showed or told them about it.
+The prior participant relationship becomes a shared-recipient relationship, not
+proof of co-experience. Because this changes the memory's semantic boundary, it
+should reset or update recall cooldown state.
+
+A single memory may have different pet roles. For example, one pet may be a
+co-experience participant while another pet is only a shared-recipient who heard
+about or was shown the moment later. Memory recall should follow each pet's own
+role in that memory rather than treating the whole memory as one uniform
+relationship to every pet. This lets one album entry represent mixed situations
+without duplicating the photo or splitting the owner's narrative too early.
+
+The first memory participant role set should stay small: `participant` for pets
+that share the co-experienced moment, `shared_with` for pets the owner later
+showed or told, and `mentioned_only` for pets that appear in the memory text but
+were neither participants nor selected recipients. `mentioned_only` does not
+grant proactive recall permission; it exists to keep the memory text truthful
+without inflating the mentioned pet's relationship to the moment.
+If the owner asks a `mentioned_only` pet about the memory, that pet may
+acknowledge that it was mentioned or that the owner/other pets have that memory,
+but it must clearly state that it did not participate and must not perform the
+scene as lived experience.
+When the owner names multiple pets with clear role language, the system may
+assign roles without an extra confirmation step. Phrases like "with X", "X
+accompanied me", or "brought X" indicate `participant`; phrases like "showed Y",
+"told Y later", or "shared the photo with Y" indicate `shared_with`; phrases
+like "Y was at home" or "thought of Y" indicate `mentioned_only`. If role
+language conflicts or is ambiguous, the system should ask for confirmation
+before writing the memory.
+
+The Memory Album should show each pet's role on a photo-backed memory, such as
+"experienced together", "shared with", or "mentioned only". This makes recall
+permissions explainable to the owner and gives the album a natural editing
+surface: the owner can adjust a pet's role from the memory detail view.
+Changing a pet's role on a memory should not automatically notify that pet or
+produce a chat announcement. The role change should affect future recall
+behavior. If the owner wants a pet to react to the change, the owner can ask or
+tell the pet directly in chat.
+
+The structured memory text and metadata are the primary record; photos are
+attached media. If an attached image is unavailable, expired, deleted, or not yet
+migrated into durable album storage, the memory may still exist and be recalled
+according to its text, participants, roles, and recall policy. The album can
+show the image as unavailable without deleting the memory by implication.
+
+In V1, one photo-backed album item should map to one primary memory. Complex
+situations should be represented through the memory description and per-pet
+roles rather than splitting one photo into multiple memory records. Future album
+facets may allow one media attachment to support multiple linked memories if the
+product needs finer organization.
+
+When a photo is first received and participating pets are not yet known, the pet
+question should use neutral wording. It should not ask "was this something we
+experienced together?" because that implies the current speaking pet may have
+participated. A better prompt is to ask whether the photo contains any pet
+memory and invite the owner to explain what happened and which pets were part of
+it.
+
+If the owner's photo explanation describes a real-life moment they want to show
+the pets, but does not authorize a co-experienced memory, the product should
+create a Shared Owner Memory when the content is non-sensitive and the intended
+recipient pets are clear. Those pets may later say the owner showed or told them
+about the moment, but must not recall it as lived experience.
+Shared Owner Memory recipient inference can be broader than co-experience
+participant inference because it does not grant lived-experience recall. If the
+owner says they want to show the moment to "you all", "everyone", or all pets in
+the home, the product may share the memory with all pets in the home. If the
+owner names a specific pet, only that pet should receive it. Co-experienced
+memories still require named or explicitly confirmed participant pets.
+If a non-sensitive photo explanation is sent in the pet group chat without
+clear co-experience language or explicit recipients, the product may treat the
+act of sending it to the pet group as sharing it with all pets in the home and
+create a low-to-normal importance Shared Owner Memory. This must not imply that
+any pet physically participated.
+After creating a photo-backed memory, the pet's confirmation reply should state
+the memory boundary clearly. For Shared Owner Memories, the reply should say the
+owner showed or told the pets about the moment. For Co-Experienced Pet Memories,
+the reply may say it is a shared memory with the named participant pets. For
+sensitive memories awaiting confirmation, the reply should acknowledge
+importance and privacy without saving yet. Confirmation copy must not blur
+Shared Owner Memory into co-experience language.
+
+If the owner says a photo is only for viewing and should not be remembered, the
+product should not create a durable memory. It may respond conversationally, but
+must clear the pending photo-memory flow so later messages do not accidentally
+attach to that photo.
+
+V1 photo memory capture should handle one photo per explanation round. Batch
+photo import should wait for a later Memory Album import flow with explicit
+selection, grouping, and review controls.
+
+Photo-backed memories should distinguish recording time from remembered event
+time. `created_at` or an equivalent capture timestamp records when the system
+saved the memory. The owner-described occurrence time should be stored
+separately, such as `happened_at` when precise or `happened_time_text` when the
+owner says "last winter", "on my birthday", or another natural-language time.
+V1 does not need to force natural-language dates into exact calendar dates.
+Album ordering may default to capture time while displaying the owner-described
+event time when present.
+
+Memory Album sharing across owners or friend pets should not be automatic in
+V1. A future cross-owner share must be owner-initiated, show exactly what will
+be shared, identify the receiving owner or pet, and require receiving-side
+confirmation before the memory enters another home context. Sensitive, private,
+or `owner_asked_only` memories should be excluded by default unless the owner
+performs an explicit separate authorization.
+
+When a photo starts a memory-capture prompt, the pet should ask once and then
+wait. If the owner does not answer, the pending photo-memory flow should expire
+after a short window, such as 10 to 30 minutes. The pet should not repeatedly
+chase the owner to explain or save the photo.
+
+When pets recall photo-backed memories, they should default to text-only recall.
+They should not proactively resend old photos in chat or desktop bubbles. The
+owner can explicitly ask to see the photo or open the album entry; the album
+detail view is the primary surface for viewing attached media.
+
+The first Memory Album filtering model should prioritize structured filters:
+pet participant/recipient, memory type, capture time, sensitive/private status,
+and later favorite or highlighted status. Semantic search can come later after
+the structured album model is useful.
 
 Photo-backed memories should be designed with a future album in mind. A first
 implementation may store Telegram source references, but the product direction

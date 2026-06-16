@@ -1,6 +1,7 @@
 import threading
+import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import requests
 
@@ -9,12 +10,19 @@ import telegram_bot
 
 class TelegramPetOnboardingTest(unittest.TestCase):
     def setUp(self) -> None:
+        telegram_bot.ALLOWED_CHAT_ID = ""
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = set()
         telegram_bot.PENDING_PET_FLOWS.clear()
         telegram_bot.PENDING_AVATAR_FLOWS.clear()
         telegram_bot.PENDING_FRIENDSHIP_INVITE_FLOWS.clear()
+        telegram_bot.PENDING_FRIEND_MEMORY_SHARE_FLOWS.clear()
         telegram_bot.PENDING_MEMORY_PHOTO_FLOWS.clear()
         telegram_bot.CURRENT_PET_IDS.clear()
         telegram_bot.OWNER_IDS_BY_CHAT.clear()
+        telegram_bot.OWNER_DISPLAY_NAMES_BY_CHAT.clear()
+        telegram_bot.FRIENDSHIP_DAILY_MESSAGE_LAST_SENT.clear()
+        telegram_bot.FRIENDSHIP_DAILY_MESSAGE_SCAN_LAST = 0.0
+        telegram_bot.MEMORY_SHARE_SUGGESTION_LAST_BY_CHAT.clear()
         telegram_bot.PET_GROUP_LAST_SPEAKER_IDS.clear()
         telegram_bot.ACTIVE_AVATAR_GENERATIONS.clear()
         telegram_bot.ACTIVE_PET_GROUP_CHATS.clear()
@@ -33,6 +41,7 @@ class TelegramPetOnboardingTest(unittest.TestCase):
         self.assertIn("创建宠物", reply_labels)
         self.assertIn("宠物关系", reply_labels)
         self.assertIn("宠物好友", reply_labels)
+        self.assertIn("宠物记忆", reply_labels)
         self.assertNotIn("宠物群聊", reply_labels)
         self.assertNotIn("设置资料", reply_labels)
         self.assertNotIn("定制形象", reply_labels)
@@ -90,6 +99,117 @@ class TelegramPetOnboardingTest(unittest.TestCase):
             telegram_bot.ALLOWED_CHAT_ID = original_chat_id
 
         send_main_menu.assert_called_once_with("chat-1")
+
+    @patch("telegram_bot.send_main_menu")
+    @patch("telegram_bot.telegram_api")
+    def test_configure_bot_ui_refreshes_keyboard_for_allowlisted_owners(
+        self,
+        _telegram_api: Mock,
+        send_main_menu: Mock,
+    ) -> None:
+        original_chat_id = telegram_bot.ALLOWED_CHAT_ID
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_CHAT_ID = "chat-1"
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-1", "chat-2"}
+        try:
+            telegram_bot.configure_bot_ui()
+        finally:
+            telegram_bot.ALLOWED_CHAT_ID = original_chat_id
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        send_main_menu.assert_has_calls([call("chat-1"), call("chat-2")])
+        self.assertEqual(2, send_main_menu.call_count)
+
+    @patch("telegram_bot.log_exception")
+    @patch("telegram_bot.send_main_menu")
+    @patch("telegram_bot.telegram_api")
+    def test_configure_bot_ui_continues_if_owner_keyboard_refresh_fails(
+        self,
+        _telegram_api: Mock,
+        send_main_menu: Mock,
+        log_exception: Mock,
+    ) -> None:
+        send_main_menu.side_effect = [RuntimeError("send failed"), None]
+        original_chat_id = telegram_bot.ALLOWED_CHAT_ID
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_CHAT_ID = ""
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-1", "chat-2"}
+        try:
+            telegram_bot.configure_bot_ui()
+        finally:
+            telegram_bot.ALLOWED_CHAT_ID = original_chat_id
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        send_main_menu.assert_has_calls([call("chat-1"), call("chat-2")])
+        self.assertEqual(2, send_main_menu.call_count)
+        log_exception.assert_called_once()
+
+    @patch("telegram_bot.log_event")
+    @patch("telegram_bot.owner_params")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.api_get_pets")
+    def test_proactive_tick_targets_owner_virtual_pets_and_sends_generated_message(
+        self,
+        api_get_pets: Mock,
+        post: Mock,
+        send_message: Mock,
+        owner_params: Mock,
+        _log_event: Mock,
+    ) -> None:
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-1"}
+        owner_params.return_value = {"owner_id": 4}
+        api_get_pets.return_value = [
+            {"id": 7, "name": "小月", "pet_mode": "virtual"},
+            {"id": 8, "name": "相机", "pet_mode": "real"},
+        ]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {
+            "event_result": {
+                "message": {
+                    "message": "妈，小月刚刚去喝水啦。",
+                },
+            },
+        }
+
+        result = telegram_bot.proactive_tick_virtual_pets_once(tick_minutes=10)
+
+        self.assertEqual({"chats": 1, "pets": 1, "messages": 1}, result)
+        post.assert_called_once_with(
+            "http://127.0.0.1:8000/virtual-pets/7/tick",
+            params={"owner_id": 4, "notify": "false"},
+            json={"minutes": 10},
+            timeout=20,
+        )
+        send_message.assert_called_once_with(
+            "chat-1",
+            "小月：妈，小月刚刚去喝水啦。",
+            reply_markup=telegram_bot.MAIN_REPLY_KEYBOARD,
+        )
+
+    @patch("telegram_bot.owner_params")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.api_get_pets")
+    def test_proactive_tick_stays_quiet_without_generated_message(
+        self,
+        api_get_pets: Mock,
+        post: Mock,
+        send_message: Mock,
+        owner_params: Mock,
+    ) -> None:
+        telegram_bot.ALLOWED_CHAT_ID = "chat-1"
+        owner_params.return_value = {}
+        api_get_pets.return_value = [
+            {"id": 7, "name": "小月", "pet_mode": "virtual"},
+        ]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"event_result": None}
+
+        result = telegram_bot.proactive_tick_virtual_pets_once(tick_minutes=10)
+
+        self.assertEqual({"chats": 1, "pets": 1, "messages": 0}, result)
+        send_message.assert_not_called()
 
     @patch("telegram_bot.send_message")
     @patch("telegram_bot.requests.post")
@@ -206,7 +326,7 @@ class TelegramPetOnboardingTest(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual("file-1", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-10"]["photo_file_id"])
-        self.assertIn("这是我们一起经历的吗", send_message.call_args.args[1])
+        self.assertIn("有哪只宠物的回忆", send_message.call_args.args[1])
 
     @patch("telegram_bot.send_message")
     def test_photo_caption_still_asks_owner_to_explain_before_memory_creation(
@@ -228,7 +348,7 @@ class TelegramPetOnboardingTest(unittest.TestCase):
             "今天我们一起在海边看晚霞，黑米和 Qing Qing 都陪着我。",
             telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"]["caption"],
         )
-        self.assertIn("这是我们一起经历的吗", send_message.call_args.args[1])
+        self.assertIn("有哪只宠物的回忆", send_message.call_args.args[1])
 
     @patch("telegram_bot.send_message")
     @patch("telegram_bot.requests.post")
@@ -258,6 +378,290 @@ class TelegramPetOnboardingTest(unittest.TestCase):
         self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
         self.assertIn("记住了", send_message.call_args.args[1])
 
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_co_experienced_photo_memory_uses_only_named_pet_participants(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [
+            {"id": 8, "name": "黑米"},
+            {"id": 7, "name": "Qing Qing"},
+        ]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 34, "memory_type": "co_experienced"}
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-1",
+            "message_id": 55,
+        }
+
+        handled = telegram_bot.handle_memory_photo_text(
+            "chat-memory",
+            "这是我们一起在海边看晚霞，黑米一直陪着我。",
+        )
+
+        self.assertTrue(handled)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual("co_experienced", payload["memory_type"])
+        self.assertEqual([8], payload["participant_pet_ids"])
+        self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
+        self.assertIn("黑米", send_message.call_args.args[1])
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_co_experienced_photo_without_named_pet_asks_for_participants(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [
+            {"id": 8, "name": "黑米"},
+            {"id": 7, "name": "Qing Qing"},
+        ]
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-1",
+            "message_id": 55,
+        }
+
+        handled = telegram_bot.handle_memory_photo_text(
+            "chat-memory",
+            "这是我们一起在海边看晚霞时拍的。",
+        )
+
+        self.assertTrue(handled)
+        post.assert_not_called()
+        self.assertEqual(
+            "await_participants",
+            telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"]["step"],
+        )
+        self.assertIn("是哪几只宠物", send_message.call_args.args[1])
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_photo_participant_confirmation_matches_ascii_name_without_spaces_or_case(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [
+            {"id": 7, "name": "Qing Qing"},
+            {"id": 8, "name": "黑米"},
+        ]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 36, "memory_type": "co_experienced"}
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "step": "await_participants",
+            "photo_file_id": "file-1",
+            "message_id": 55,
+            "pending_content": "带着qingqing出去玩了",
+        }
+
+        handled = telegram_bot.handle_memory_photo_text("chat-memory", "qingqing")
+
+        self.assertTrue(handled)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual([7], payload["participant_pet_ids"])
+        self.assertEqual([{"pet_id": 7, "role": "participant"}], payload["participants"])
+        self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
+        self.assertIn("Qing Qing", send_message.call_args.args[1])
+
+    def test_direct_pet_name_matching_accepts_light_fuzzy_ascii_reference(self) -> None:
+        pets = [
+            {"id": 7, "name": "Qing Qing"},
+            {"id": 8, "name": "黑米"},
+        ]
+
+        mentioned = telegram_bot._directly_mentioned_pets("今天带 qingqin 出去玩", pets)
+
+        self.assertEqual([7], [pet["id"] for pet in mentioned])
+
+    def test_direct_pet_name_matching_avoids_ambiguous_fuzzy_reference(self) -> None:
+        pets = [
+            {"id": 7, "name": "Qing Qing"},
+            {"id": 8, "name": "Qing Qong"},
+        ]
+
+        mentioned = telegram_bot._directly_mentioned_pets("今天带 qing qing 出去玩", pets)
+
+        self.assertEqual([7], [pet["id"] for pet in mentioned])
+
+        mentioned = telegram_bot._directly_mentioned_pets("今天带 qingqng 出去玩", pets)
+
+        self.assertEqual([], mentioned)
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_sensitive_photo_memory_asks_before_saving(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [{"id": 8, "name": "黑米"}]
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-1",
+            "message_id": 55,
+        }
+
+        handled = telegram_bot.handle_memory_photo_text(
+            "chat-memory",
+            "这是我失眠那晚拍的，黑米一直陪着我。",
+        )
+
+        self.assertTrue(handled)
+        post.assert_not_called()
+        self.assertEqual(
+            "await_sensitive_confirm",
+            telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"]["step"],
+        )
+        self.assertIn("有点私密", send_message.call_args.args[1])
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_sensitive_photo_memory_confirmation_saves_restricted_memory(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [{"id": 8, "name": "黑米"}]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 35, "memory_type": "co_experienced"}
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "step": "await_sensitive_confirm",
+            "photo_file_id": "file-1",
+            "message_id": 55,
+            "pending_content": "这是我失眠那晚拍的，黑米一直陪着我。",
+            "pending_participant_pet_ids": [8],
+        }
+
+        handled = telegram_bot.handle_memory_photo_text("chat-memory", "记住")
+
+        self.assertTrue(handled)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual("private", payload["visibility"])
+        self.assertEqual("owner_asked_only", payload["recall_policy"])
+        self.assertEqual([{"pet_id": 8, "role": "participant"}], payload["participants"])
+        self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
+        self.assertIn("只会在你问起时提", send_message.call_args.args[1])
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    def test_photo_memory_cancel_text_clears_pending_flow(self, post: Mock, send_message: Mock) -> None:
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-1",
+            "message_id": 55,
+        }
+
+        handled = telegram_bot.handle_memory_photo_text("chat-memory", "不要记住，只是给你看看")
+
+        self.assertTrue(handled)
+        post.assert_not_called()
+        self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
+        self.assertIn("不写进长期记忆", send_message.call_args.args[1])
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    def test_photo_memory_pending_flow_expires(self, post: Mock, send_message: Mock) -> None:
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-1",
+            "message_id": 55,
+            "created_monotonic": time.monotonic() - telegram_bot.MEMORY_PHOTO_PENDING_TTL_SECONDS - 1,
+        }
+
+        handled = telegram_bot.handle_memory_photo_text("chat-memory", "这是我们一起去海边")
+
+        self.assertTrue(handled)
+        post.assert_not_called()
+        self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
+        self.assertIn("已经过期", send_message.call_args.args[1])
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_text_after_photo_with_named_pet_creates_pet_milestone_memory(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [{"id": 9, "name": "解放"}]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 33, "memory_type": "pet_milestone"}
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-2",
+            "message_id": 56,
+        }
+
+        handled = telegram_bot.handle_memory_photo_text(
+            "chat-memory",
+            "这个照片是解放出去玩时候给他拍的",
+        )
+
+        self.assertTrue(handled)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual("pet_milestone", payload["memory_type"])
+        self.assertEqual("recallable", payload["use_class"])
+        self.assertEqual([9], payload["participant_pet_ids"])
+        self.assertEqual("file-2", payload["metadata"]["telegram_photo_file_id"])
+        self.assertNotIn("chat-memory", telegram_bot.PENDING_MEMORY_PHOTO_FLOWS)
+        self.assertIn("解放", send_message.call_args.args[1])
+        handle_group_chat.assert_called_once_with(
+            "chat-memory",
+            "这个照片是解放出去玩时候给他拍的",
+        )
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_direct_question_after_pet_photo_memory_routes_to_group_chat(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [{"id": 9, "name": "解放"}]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 33, "memory_type": "pet_milestone"}
+        handle_group_chat.return_value = True
+        telegram_bot.PENDING_MEMORY_PHOTO_FLOWS["chat-memory"] = {
+            "photo_file_id": "file-2",
+            "message_id": 56,
+        }
+
+        telegram_bot.handle_message(
+            {"chat": {"id": "chat-memory"}, "text": "这个照片是解放出去玩时候给他拍的"}
+        )
+        telegram_bot.handle_message({"chat": {"id": "chat-memory"}, "text": "解放怎么说？"})
+
+        self.assertEqual(
+            [
+                call("chat-memory", "这个照片是解放出去玩时候给他拍的"),
+                call("chat-memory", "解放怎么说？"),
+            ],
+            handle_group_chat.call_args_list,
+        )
+
     @patch("telegram_bot.handle_pet_group_chat_text")
     def test_unknown_text_routes_to_pet_group_chat(self, handle_group_chat: Mock) -> None:
         handle_group_chat.return_value = True
@@ -269,6 +673,133 @@ class TelegramPetOnboardingTest(unittest.TestCase):
             telegram_bot.ALLOWED_CHAT_ID = original_chat_id
 
         handle_group_chat.assert_called_once_with("chat-11", "生成好了吗")
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_explicit_remember_text_creates_recallable_group_memory(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [{"id": 8, "name": "青团"}]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 41, "title": "群聊记忆"}
+        original_chat_id = telegram_bot.ALLOWED_CHAT_ID
+        original_owner_chat_ids = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_CHAT_ID = ""
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = set()
+        try:
+            telegram_bot.handle_message({"chat": {"id": "chat-memory"}, "text": "记住这个：青团喜欢被叫小团子"})
+        finally:
+            telegram_bot.ALLOWED_CHAT_ID = original_chat_id
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_owner_chat_ids
+
+        self.assertEqual("owner_shared", post.call_args.kwargs["json"]["memory_type"])
+        self.assertEqual("recallable", post.call_args.kwargs["json"]["use_class"])
+        self.assertEqual("青团喜欢被叫小团子", post.call_args.kwargs["json"]["content"])
+        self.assertEqual([8], post.call_args.kwargs["json"]["participant_pet_ids"])
+        self.assertIn("记下了", send_message.call_args.args[1])
+        handle_group_chat.assert_not_called()
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.post")
+    @patch("telegram_bot.requests.get")
+    def test_low_sensitivity_name_preference_creates_behavioral_memory(
+        self,
+        get: Mock,
+        post: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [{"id": 8, "name": "青团"}]
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"id": 42, "title": "称呼偏好"}
+        original_chat_id = telegram_bot.ALLOWED_CHAT_ID
+        original_owner_chat_ids = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_CHAT_ID = ""
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = set()
+        try:
+            telegram_bot.handle_message({"chat": {"id": "chat-memory"}, "text": "以后叫我阿澈"})
+        finally:
+            telegram_bot.ALLOWED_CHAT_ID = original_chat_id
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_owner_chat_ids
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual("behavioral", payload["use_class"])
+        self.assertEqual("称呼偏好", payload["title"])
+        self.assertIn("阿澈", payload["content"])
+        self.assertIn("以后叫你阿澈", send_message.call_args.args[1])
+        handle_group_chat.assert_not_called()
+
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.get")
+    def test_memory_menu_lists_recent_memories(self, get: Mock, send_message: Mock) -> None:
+        pets_response = Mock(status_code=200)
+        pets_response.json.return_value = [{"id": 8, "name": "青团"}]
+        memories_response = Mock(status_code=200)
+        memories_response.json.return_value = [
+            {
+                "id": 9,
+                "title": "称呼偏好",
+                "content": "主人希望宠物以后叫 TA 阿澈。",
+                "use_class": "behavioral",
+                "participant_pet_ids": [8],
+            }
+        ]
+        get.side_effect = [pets_response, memories_response]
+
+        original_owner_chat_ids = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = set()
+        try:
+            telegram_bot.handle_memory_menu("chat-memory")
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_owner_chat_ids
+
+        text = send_message.call_args.args[1]
+        self.assertIn("#9", text)
+        self.assertIn("称呼偏好", text)
+        self.assertIn("behavioral", text)
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.delete")
+    @patch("telegram_bot.requests.get")
+    def test_forget_memory_command_deletes_memory(
+        self,
+        get: Mock,
+        delete: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        pets_response = Mock(status_code=200)
+        pets_response.json.return_value = [{"id": 8, "name": "青团"}]
+        memories_response = Mock(status_code=200)
+        memories_response.json.return_value = [
+            {"id": 9, "title": "称呼偏好", "participant_pet_ids": [8]}
+        ]
+        get.side_effect = [pets_response, memories_response]
+        delete.return_value.status_code = 200
+        delete.return_value.json.return_value = {"id": 9, "title": "称呼偏好"}
+        original_chat_id = telegram_bot.ALLOWED_CHAT_ID
+        original_owner_chat_ids = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_CHAT_ID = ""
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = set()
+        try:
+            telegram_bot.handle_message({"chat": {"id": "chat-memory"}, "text": "忘记记忆 9"})
+        finally:
+            telegram_bot.ALLOWED_CHAT_ID = original_chat_id
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_owner_chat_ids
+
+        self.assertTrue(delete.call_args.args[0].endswith("/pet-memories/9"))
+        self.assertIn("已忘记", send_message.call_args.args[1])
+        handle_group_chat.assert_not_called()
 
     @patch("telegram_bot.requests.post")
     def test_telegram_api_includes_response_details_on_failure(self, post: Mock) -> None:
@@ -581,6 +1112,176 @@ class TelegramPetOnboardingTest(unittest.TestCase):
             timeout=10,
         )
         self.assertIn("已经成为好友", send_message.call_args.args[1])
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.get")
+    def test_share_to_named_friend_owner_forwards_across_owner_chats(
+        self,
+        get: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-a", "chat-b"}
+        telegram_bot.OWNER_IDS_BY_CHAT["chat-a"] = 1
+        telegram_bot.CURRENT_PET_IDS["chat-a"] = 7
+
+        def get_response(url: str, **_kwargs: object) -> Mock:
+            response = Mock(status_code=200)
+            if url.endswith("/pets"):
+                response.json.return_value = [{"id": 7, "name": "黑米", "owner_id": 1}]
+            elif url.endswith("/pet-friendships"):
+                response.json.return_value = [
+                    {
+                        "id": 3,
+                        "pet_a_id": 7,
+                        "pet_a_name": "黑米",
+                        "owner_a_id": 1,
+                        "owner_a_name": "小明",
+                        "owner_a_chat_id": "chat-a",
+                        "pet_b_id": 8,
+                        "pet_b_name": "青青",
+                        "owner_b_id": 2,
+                        "owner_b_name": "小红",
+                        "owner_b_chat_id": "chat-b",
+                        "affinity": 50,
+                        "muted": False,
+                    }
+                ]
+            else:
+                response.json.return_value = []
+            return response
+
+        get.side_effect = get_response
+        try:
+            telegram_bot.handle_message(
+                {
+                    "chat": {"id": "chat-a"},
+                    "text": "分享给小红：今天黑米学会了握手",
+                }
+            )
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        self.assertEqual("chat-b", send_message.call_args_list[0].args[0])
+        self.assertIn("今天黑米学会了握手", send_message.call_args_list[0].args[1])
+        self.assertIn("已分享给小红", send_message.call_args_list[1].args[1])
+        handle_group_chat.assert_not_called()
+
+    @patch("telegram_bot.handle_pet_group_chat_text")
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.get")
+    def test_memory_share_to_friend_requires_owner_confirmation(
+        self,
+        get: Mock,
+        send_message: Mock,
+        handle_group_chat: Mock,
+    ) -> None:
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-a", "chat-b"}
+        telegram_bot.OWNER_IDS_BY_CHAT["chat-a"] = 1
+        telegram_bot.CURRENT_PET_IDS["chat-a"] = 7
+
+        def get_response(url: str, **_kwargs: object) -> Mock:
+            response = Mock(status_code=200)
+            if url.endswith("/pets"):
+                response.json.return_value = [{"id": 7, "name": "黑米", "owner_id": 1}]
+            elif url.endswith("/pet-memories"):
+                response.json.return_value = [
+                    {
+                        "id": 9,
+                        "title": "握手进步",
+                        "content": "黑米今天第一次学会握手。",
+                        "use_class": "recallable",
+                        "participant_pet_ids": [7],
+                    }
+                ]
+            elif url.endswith("/pet-friendships"):
+                response.json.return_value = [
+                    {
+                        "id": 3,
+                        "pet_a_id": 7,
+                        "pet_a_name": "黑米",
+                        "owner_a_id": 1,
+                        "owner_a_name": "小明",
+                        "owner_a_chat_id": "chat-a",
+                        "pet_b_id": 8,
+                        "pet_b_name": "青青",
+                        "owner_b_id": 2,
+                        "owner_b_name": "小红",
+                        "owner_b_chat_id": "chat-b",
+                        "affinity": 50,
+                        "muted": False,
+                    }
+                ]
+            else:
+                response.json.return_value = []
+            return response
+
+        get.side_effect = get_response
+        try:
+            telegram_bot.handle_message({"chat": {"id": "chat-a"}, "text": "分享记忆 9 给 小红"})
+            self.assertEqual(1, send_message.call_count)
+            self.assertIn("确认分享", send_message.call_args.args[1])
+
+            telegram_bot.handle_message({"chat": {"id": "chat-a"}, "text": "确认分享"})
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        self.assertEqual("chat-b", send_message.call_args_list[1].args[0])
+        self.assertIn("黑米今天第一次学会握手", send_message.call_args_list[1].args[1])
+        self.assertIn("已分享这条记忆", send_message.call_args_list[2].args[1])
+        handle_group_chat.assert_not_called()
+
+    @patch("telegram_bot.random.choice", return_value="{local_pet_name} 想问问 {friend_pet_name}：今天好吗？")
+    @patch("telegram_bot.random.random", return_value=0.0)
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.get")
+    def test_friendship_daily_message_uses_friendship_relationships(
+        self,
+        get: Mock,
+        send_message: Mock,
+        _random: Mock,
+        _choice: Mock,
+    ) -> None:
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        original_chance = telegram_bot.PET_FRIEND_DAILY_MESSAGE_CHANCE
+        original_interval = telegram_bot.PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-a"}
+        telegram_bot.OWNER_IDS_BY_CHAT["chat-a"] = 1
+        telegram_bot.PET_FRIEND_DAILY_MESSAGE_CHANCE = 1.0
+        telegram_bot.PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS = 0
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = [
+            {
+                "id": 3,
+                "pet_a_id": 7,
+                "pet_a_name": "黑米",
+                "owner_a_id": 1,
+                "owner_a_name": "小明",
+                "owner_a_chat_id": "chat-a",
+                "pet_b_id": 8,
+                "pet_b_name": "青青",
+                "owner_b_id": 2,
+                "owner_b_name": "小红",
+                "owner_b_chat_id": "chat-b",
+                "affinity": 80,
+                "muted": False,
+            }
+        ]
+        try:
+            sent = telegram_bot.maybe_send_friendship_daily_messages(now=1000.0)
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+            telegram_bot.PET_FRIEND_DAILY_MESSAGE_CHANCE = original_chance
+            telegram_bot.PET_FRIEND_DAILY_MESSAGE_INTERVAL_SECONDS = original_interval
+
+        self.assertEqual(1, sent)
+        send_message.assert_called_once()
+        self.assertEqual("chat-b", send_message.call_args.args[0])
+        self.assertIn("黑米", send_message.call_args.args[1])
+        self.assertIn("青青", send_message.call_args.args[1])
 
     @patch("telegram_bot.send_message")
     @patch("telegram_bot.requests.get")
@@ -1300,6 +2001,99 @@ class TelegramPetOnboardingTest(unittest.TestCase):
         self.assertEqual("黑米：姐姐，我先看一眼再说。", send_message.call_args.args[1])
         reaction_gate_llm_call.assert_not_called()
 
+    @patch("telegram_bot.send_message")
+    @patch("telegram_bot.requests.get")
+    def test_pet_group_chat_fetches_owner_scoped_relevant_memories(
+        self,
+        get: Mock,
+        send_message: Mock,
+    ) -> None:
+        pets = [
+            {"id": 8, "name": "青团", "species": "cat", "personality": "gentle", "owner_call_name": "妈"},
+        ]
+        relationships: list[dict[str, object]] = []
+        memories = [
+            {
+                "id": 21,
+                "memory_type": "owner_shared",
+                "title": "称呼偏好",
+                "content": "主人希望宠物以后叫 TA 阿澈。",
+                "source": "telegram",
+                "use_class": "behavioral",
+                "importance": 4,
+                "participant_pet_ids": [8],
+                "recall_guidance": "Use as behavior.",
+            },
+            {
+                "id": 22,
+                "memory_type": "owner_shared",
+                "title": "小团子",
+                "content": "青团喜欢被叫小团子。",
+                "source": "telegram",
+                "use_class": "recallable",
+                "importance": 4,
+                "participant_pet_ids": [8],
+                "recall_guidance": "Can recall.",
+            },
+            {
+                "id": 23,
+                "memory_type": "owner_shared",
+                "title": "别人的记忆",
+                "content": "另一位主人家的宠物喜欢星星。",
+                "source": "telegram",
+                "use_class": "recallable",
+                "importance": 5,
+                "participant_pet_ids": [99],
+                "recall_guidance": "Can recall.",
+            },
+            {
+                "id": 24,
+                "memory_type": "owner_shared",
+                "title": "敏感记忆",
+                "content": "这是一条 private 记忆。",
+                "source": "telegram",
+                "use_class": "private",
+                "importance": 5,
+                "participant_pet_ids": [8],
+                "recall_guidance": "Private.",
+            },
+        ]
+        get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=pets), raise_for_status=Mock()),
+            Mock(status_code=200, json=Mock(return_value=relationships), raise_for_status=Mock()),
+            Mock(status_code=200, json=Mock(return_value=memories), raise_for_status=Mock()),
+        ]
+        original_allowed = telegram_bot.ALLOWED_OWNER_CHAT_IDS
+        telegram_bot.ALLOWED_OWNER_CHAT_IDS = {"chat-group"}
+        telegram_bot.OWNER_IDS_BY_CHAT["chat-group"] = 12
+        llm_call = Mock(
+            return_value={
+                "model": "gpt-test",
+                "content": [{"type": "text", "text": "喜欢，小团子听起来软软的。"}],
+            }
+        )
+        try:
+            handled = telegram_bot.handle_pet_group_chat_text(
+                "chat-group",
+                "青团，小团子这个名字还喜欢吗？",
+                llm_call=llm_call,
+            )
+        finally:
+            telegram_bot.ALLOWED_OWNER_CHAT_IDS = original_allowed
+
+        self.assertTrue(handled)
+        memory_get_call = get.call_args_list[2]
+        self.assertEqual(
+            {"limit": 24, "visibility": "home", "owner_id": 12},
+            memory_get_call.kwargs["params"],
+        )
+        llm_prompt = llm_call.call_args.args[0][1]["content"]
+        self.assertIn("小团子", llm_prompt)
+        self.assertIn("称呼偏好", llm_prompt)
+        self.assertNotIn("别人的记忆", llm_prompt)
+        self.assertNotIn("private 记忆", llm_prompt)
+        self.assertEqual("青团：喜欢，小团子听起来软软的。", send_message.call_args.args[1])
+
     def test_reaction_gate_decline_does_not_start_relationship_cooldown(self) -> None:
         pets = [
             {"id": 8, "name": "黑米", "species": "cat"},
@@ -1390,6 +2184,60 @@ class TelegramPetOnboardingTest(unittest.TestCase):
 
         self.assertEqual([2], [item["id"] for item in context])
         self.assertFalse(context[0]["speaker_participates"])
+
+    def test_pet_memory_context_respects_per_pet_memory_roles(self) -> None:
+        context = telegram_bot.build_pet_memory_context_for_prompt(
+            memories=[
+                {
+                    "id": 1,
+                    "memory_type": "co_experienced",
+                    "title": "海边",
+                    "content": "黑米一起看海边，Qing Qing 后来看了照片。",
+                    "participants": [
+                        {"pet_id": 8, "role": "participant"},
+                        {"pet_id": 7, "role": "shared_with"},
+                        {"pet_id": 9, "role": "mentioned_only"},
+                    ],
+                    "recall_guidance": "Only participant pets may recall this as a lived shared experience.",
+                }
+            ],
+            speaker_pet_id=7,
+        )
+
+        self.assertEqual([1], [item["id"] for item in context])
+        self.assertEqual("shared_with", context[0]["speaker_memory_role"])
+        self.assertFalse(context[0]["speaker_participates"])
+
+        mentioned_context = telegram_bot.build_pet_memory_context_for_prompt(
+            memories=[
+                {
+                    "id": 1,
+                    "memory_type": "co_experienced",
+                    "participants": [
+                        {"pet_id": 9, "role": "mentioned_only"},
+                    ],
+                }
+            ],
+            speaker_pet_id=9,
+        )
+        self.assertEqual([], mentioned_context)
+
+    def test_pet_memory_context_excludes_owner_asked_only_from_proactive_prompt(self) -> None:
+        context = telegram_bot.build_pet_memory_context_for_prompt(
+            memories=[
+                {
+                    "id": 1,
+                    "memory_type": "owner_shared",
+                    "title": "私密照片",
+                    "content": "主人确认保存但只能问起时提。",
+                    "recall_policy": "owner_asked_only",
+                    "participant_pet_ids": [8],
+                }
+            ],
+            speaker_pet_id=8,
+        )
+
+        self.assertEqual([], context)
 
     @patch("telegram_bot.log_exception")
     @patch("telegram_bot.send_message")
@@ -1561,7 +2409,7 @@ class TelegramPetOnboardingTest(unittest.TestCase):
         telegram_bot.handle_action_button("chat-action", "feed")
 
         self.assertEqual("http://127.0.0.1:8000/virtual-pets/8/actions", post.call_args.args[0])
-        self.assertIn("黑米", send_message.call_args.args[1])
+        self.assertTrue(send_message.call_args.args[1].startswith("黑米："))
 
     @patch("telegram_bot.threading.Thread")
     @patch("telegram_bot.send_message")

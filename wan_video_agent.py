@@ -1,12 +1,16 @@
-"""Wan image-to-video desktop pet animation helpers."""
+"""Wan video desktop pet animation helpers."""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import mimetypes
 import os
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Sequence
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -17,8 +21,11 @@ from desktop_pet_assets import _prepare_pose_image_from_image, _save_gif
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_DIR = PROJECT_ROOT / "static"
-DEFAULT_WAN_I2V_MODEL = "wan2.2-i2v-plus"
+DEFAULT_WAN_VIDEO_MODEL = "wan2.2-kf2v-flash"
+DEFAULT_WAN_VIDEO_RESOLUTION = "720P"
 DEFAULT_DASHSCOPE_BASE_HTTP_API_URL = "https://dashscope.aliyuncs.com/api/v1"
+DEFAULT_WAN_GIF_DURATION_MS = 5000
+DEFAULT_CLOUDFLARE_R2_KEY_PREFIX = "agent-demo/wan"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -28,13 +35,149 @@ GREEN_SCREEN_CONTRACT = (
 )
 
 
+def _cloudflare_r2_config() -> dict[str, str] | None:
+    keys = (
+        "CLOUDFLARE_R2_ACCOUNT_ID",
+        "CLOUDFLARE_R2_ACCESS_KEY_ID",
+        "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
+        "CLOUDFLARE_R2_BUCKET",
+        "CLOUDFLARE_R2_PUBLIC_BASE_URL",
+    )
+    values = {key: os.getenv(key, "").strip() for key in keys}
+    if not any(values.values()):
+        return None
+    missing = [key for key in keys if not values[key]]
+    if missing:
+        raise ValueError(f"Cloudflare R2 配置不完整，缺少：{', '.join(missing)}。")
+    values["CLOUDFLARE_R2_KEY_PREFIX"] = os.getenv(
+        "CLOUDFLARE_R2_KEY_PREFIX",
+        DEFAULT_CLOUDFLARE_R2_KEY_PREFIX,
+    ).strip().strip("/")
+    values["CLOUDFLARE_R2_ACCOUNT_ID"] = _cloudflare_r2_account_id(
+        values["CLOUDFLARE_R2_ACCOUNT_ID"]
+    )
+    return values
+
+
+def _cloudflare_r2_account_id(account_or_endpoint: str) -> str:
+    value = account_or_endpoint.strip().rstrip("/")
+    if "://" in value:
+        host = urlparse(value).netloc
+        return host.split(".", 1)[0]
+    if ".r2.cloudflarestorage.com" in value:
+        return value.split(".", 1)[0]
+    return value
+
+
+def _aws_v4_signing_key(secret_key: str, date_stamp: str) -> bytes:
+    date_key = hmac.new(f"AWS4{secret_key}".encode("utf-8"), date_stamp.encode("utf-8"), hashlib.sha256).digest()
+    region_key = hmac.new(date_key, b"auto", hashlib.sha256).digest()
+    service_key = hmac.new(region_key, b"s3", hashlib.sha256).digest()
+    return hmac.new(service_key, b"aws4_request", hashlib.sha256).digest()
+
+
+def _cloudflare_r2_authorization_headers(
+    *,
+    access_key_id: str,
+    secret_access_key: str,
+    host: str,
+    canonical_uri: str,
+    content_type: str,
+    payload: bytes,
+) -> dict[str, str]:
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    headers_to_sign = {
+        "content-type": content_type,
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    signed_headers = ";".join(sorted(headers_to_sign))
+    canonical_headers = "".join(f"{key}:{headers_to_sign[key]}\n" for key in sorted(headers_to_sign))
+    canonical_request = "\n".join(
+        [
+            "PUT",
+            canonical_uri,
+            "",
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    credential_scope = f"{date_stamp}/auto/s3/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+    signature = hmac.new(
+        _aws_v4_signing_key(secret_access_key, date_stamp),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    authorization = (
+        "AWS4-HMAC-SHA256 "
+        f"Credential={access_key_id}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+    return {**headers_to_sign, "Authorization": authorization}
+
+
+def _cloudflare_r2_public_url(public_base_url: str, object_key: str) -> str:
+    return urljoin(public_base_url.strip().rstrip("/") + "/", quote(object_key, safe="/-_.~"))
+
+
+def _cloudflare_r2_object_key(clean_url: str, payload: bytes, prefix: str) -> str:
+    static_path = Path(clean_url.lstrip("/"))
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    hashed_name = f"{static_path.stem}-{digest}{static_path.suffix}"
+    object_path = (static_path.parent / hashed_name).as_posix()
+    return f"{prefix}/{object_path}" if prefix else object_path
+
+
+def _upload_static_file_to_cloudflare_r2(source_path: Path, clean_url: str, config: dict[str, str]) -> str:
+    if not source_path.exists():
+        raise ValueError("Cloudflare R2 上传源文件不存在。")
+    payload = source_path.read_bytes()
+    object_key = _cloudflare_r2_object_key(clean_url, payload, config["CLOUDFLARE_R2_KEY_PREFIX"])
+    content_type = mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
+    host = f"{config['CLOUDFLARE_R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+    canonical_uri = "/" + quote(f"{config['CLOUDFLARE_R2_BUCKET']}/{object_key}", safe="/-_.~")
+    endpoint = f"https://{host}{canonical_uri}"
+    headers = _cloudflare_r2_authorization_headers(
+        access_key_id=config["CLOUDFLARE_R2_ACCESS_KEY_ID"],
+        secret_access_key=config["CLOUDFLARE_R2_SECRET_ACCESS_KEY"],
+        host=host,
+        canonical_uri=canonical_uri,
+        content_type=content_type,
+        payload=payload,
+    )
+    response = requests.put(endpoint, data=payload, headers=headers, timeout=60)
+    response.raise_for_status()
+    return _cloudflare_r2_public_url(config["CLOUDFLARE_R2_PUBLIC_BASE_URL"], object_key)
+
+
 def static_url_to_public_url(image_url: str) -> str:
-    public_base_url = os.getenv("PET_AGENT_PUBLIC_BASE_URL", "").strip().rstrip("/")
-    if not public_base_url:
-        raise ValueError("使用 Wan 图生视频需要设置 PET_AGENT_PUBLIC_BASE_URL，让 Wan 能访问基础形象图。")
     clean_url = image_url.split("?", 1)[0]
+    if clean_url.startswith(("https://", "http://")):
+        return clean_url
     if not clean_url.startswith("/static/"):
         raise ValueError("Wan 图生视频目前只支持本地 /static/ 形象图。")
+
+    r2_config = _cloudflare_r2_config()
+    if r2_config is not None:
+        return _upload_static_file_to_cloudflare_r2(PROJECT_ROOT / clean_url.lstrip("/"), clean_url, r2_config)
+
+    public_base_url = os.getenv("PET_AGENT_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not public_base_url:
+        raise ValueError("使用 Wan 图生视频需要设置 PET_AGENT_PUBLIC_BASE_URL，或配置 Cloudflare R2 公开桶。")
     return urljoin(public_base_url + "/", clean_url.lstrip("/"))
 
 
@@ -68,11 +211,14 @@ def wan_prompt_for_animation(animation_name: str) -> str:
             "角色必须用符合自身身体结构的方式移动，不要坐着滑动、不要原地保持坐姿。"
             "如果角色是人形或有人形手臂，手臂自然下垂并随步伐轻微摆动，不要端起或僵硬抬手；"
             "如果角色是四足动物，就按正常四足动物步态运动，不要添加人类手臂或人腿；"
-            "如果角色是章鱼、鱿鱼、蜗牛、蛞蝓或其他软体动物，就不要做人类或哺乳动物步态，"
-            "必须保留柔软身体和腕足/触手，用腕足交替支撑爬行、贴地蠕动或轻轻滑行前进；"
-            "如果角色是章鱼或触手生物，就保留触手，不要添加人类腿、脚、鞋或手；"
+            "如果角色是章鱼、鱿鱼、鱼类、水母、海马、海豚、虾、蟹、海龟或其他海洋或水生动物，"
+            "一律使用游动姿势，不要做贴地爬行、走路或哺乳动物步态；"
+            "如果角色是章鱼、鱿鱼或其他腕足触手类海洋动物，必须使用游动漂移："
+            "身体悬浮滑行，腕足像柔软飘带一样自然展开、收拢和波动，部分腕足向后轻轻扫动制造推进感；"
+            "不要让腕足吸附地面或像脚一样交替走路。"
+            "必须保留原本的腕足、触手、鱼鳍、尾巴或水生身体结构，用腕足、触手、鱼鳍、尾巴或身体波动表现前进。"
             "如果角色是鱼类，就用尾巴和尾鳍左右摆动的游动方式前进，身体轻微摆动，不要添加腿、脚或走路步态。"
-            "步行动作清晰，身体整体位置稳定，适合桌宠在 Swift 窗口中整体移动。"
+            "不要添加人类腿、脚、鞋或手。移动动作清晰，身体整体位置稳定，适合桌宠在 Swift 窗口中整体移动。"
         )
     elif animation_name == "walk_left":
         action_prompt = (
@@ -81,11 +227,14 @@ def wan_prompt_for_animation(animation_name: str) -> str:
             "角色必须用符合自身身体结构的方式移动，不要坐着滑动、不要原地保持坐姿。"
             "如果角色是人形或有人形手臂，手臂自然下垂并随步伐轻微摆动，不要端起或僵硬抬手；"
             "如果角色是四足动物，就按正常四足动物步态运动，不要添加人类手臂或人腿；"
-            "如果角色是章鱼、鱿鱼、蜗牛、蛞蝓或其他软体动物，就不要做人类或哺乳动物步态，"
-            "必须保留柔软身体和腕足/触手，用腕足交替支撑爬行、贴地蠕动或轻轻滑行前进；"
-            "如果角色是章鱼或触手生物，就保留触手，不要添加人类腿、脚、鞋或手；"
+            "如果角色是章鱼、鱿鱼、鱼类、水母、海马、海豚、虾、蟹、海龟或其他海洋或水生动物，"
+            "一律使用游动姿势，不要做贴地爬行、走路或哺乳动物步态；"
+            "如果角色是章鱼、鱿鱼或其他腕足触手类海洋动物，必须使用游动漂移："
+            "身体悬浮滑行，腕足像柔软飘带一样自然展开、收拢和波动，部分腕足向后轻轻扫动制造推进感；"
+            "不要让腕足吸附地面或像脚一样交替走路。"
+            "必须保留原本的腕足、触手、鱼鳍、尾巴或水生身体结构，用腕足、触手、鱼鳍、尾巴或身体波动表现前进。"
             "如果角色是鱼类，就用尾巴和尾鳍左右摆动的游动方式前进，身体轻微摆动，不要添加腿、脚或走路步态。"
-            "步行动作清晰，身体整体位置稳定，适合桌宠在 Swift 窗口中整体移动。"
+            "不要添加人类腿、脚、鞋或手。移动动作清晰，身体整体位置稳定，适合桌宠在 Swift 窗口中整体移动。"
         )
     elif animation_name == "sleep":
         action_prompt = "生成角色睡眠呼吸动作，角色安静睡着，身体轻微起伏。"
@@ -99,6 +248,21 @@ def wan_prompt_for_animation(animation_name: str) -> str:
         "首帧和尾帧一致，适合无缝循环和转成透明 GIF。"
         f"{GREEN_SCREEN_CONTRACT}"
     )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _wan_video_model(model: str | None) -> str:
+    return model or os.getenv("WAN_VIDEO_MODEL", DEFAULT_WAN_VIDEO_MODEL)
+
+
+def _is_kf2v_model(model: str) -> bool:
+    return "kf2v" in model.lower()
 
 
 def generate_wan_video_url(
@@ -122,15 +286,43 @@ def generate_wan_video_url(
         "DASHSCOPE_BASE_HTTP_API_URL",
         DEFAULT_DASHSCOPE_BASE_HTTP_API_URL,
     )
-    rsp = VideoSynthesis.async_call(
-        model=model or os.getenv("WAN_I2V_MODEL", DEFAULT_WAN_I2V_MODEL),
-        prompt=prompt,
-        img_url=image_url,
-    )
+    model_name = _wan_video_model(model)
+
+    if _is_kf2v_model(model_name):
+        try:
+            rsp = VideoSynthesis.call(
+                api_key=api_key,
+                model=model_name,
+                prompt=prompt,
+                first_frame_url=image_url,
+                last_frame_url=image_url,
+                resolution=os.getenv("WAN_VIDEO_RESOLUTION", DEFAULT_WAN_VIDEO_RESOLUTION),
+                prompt_extend=_env_bool("WAN_PROMPT_EXTEND", True),
+            )
+        except Exception as exc:
+            raise ValueError(f"Wan 图生视频任务失败：{exc}") from exc
+        if rsp.status_code != HTTPStatus.OK:
+            raise ValueError(f"Wan 图生视频任务失败：{rsp.status_code} {rsp.code} {rsp.message}")
+        video_url = getattr(rsp.output, "video_url", None)
+        if not video_url:
+            raise ValueError("Wan 图生视频完成但没有返回 video_url。")
+        return video_url
+
+    try:
+        rsp = VideoSynthesis.async_call(
+            model=model_name,
+            prompt=prompt,
+            img_url=image_url,
+        )
+    except Exception as exc:
+        raise ValueError(f"Wan 图生视频任务创建失败：{exc}") from exc
     if rsp.status_code != HTTPStatus.OK:
         raise ValueError(f"Wan 图生视频任务创建失败：{rsp.status_code} {rsp.code} {rsp.message}")
 
-    rsp = VideoSynthesis.wait(rsp)
+    try:
+        rsp = VideoSynthesis.wait(rsp)
+    except Exception as exc:
+        raise ValueError(f"Wan 图生视频任务失败：{exc}") from exc
     if rsp.status_code != HTTPStatus.OK:
         raise ValueError(f"Wan 图生视频任务失败：{rsp.status_code} {rsp.code} {rsp.message}")
 
@@ -180,6 +372,7 @@ def video_to_gif(
     frame_paths: Sequence[Path],
     fps: float = 8.0,
     duration_ms: int = 160,
+    target_duration_ms: int | None = None,
     max_frames: int | None = None,
 ) -> list[Path]:
     frames = []
@@ -205,7 +398,16 @@ def video_to_gif(
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.save(path)
         saved_paths.append(path)
-    _save_gif(gif_path, frames, duration=duration_ms)
+    gif_frame_duration_ms: int | list[int] = duration_ms
+    if target_duration_ms is not None:
+        total_centiseconds = max(len(frames) * 2, round(target_duration_ms / 10))
+        base_centiseconds = total_centiseconds // len(frames)
+        extra_centiseconds = total_centiseconds % len(frames)
+        gif_frame_duration_ms = [
+            (base_centiseconds + (1 if index < extra_centiseconds else 0)) * 10
+            for index in range(len(frames))
+        ]
+    _save_gif(gif_path, frames, duration=gif_frame_duration_ms)
     return saved_paths
 
 
@@ -216,6 +418,7 @@ def generate_wan_animation_gif(
     output_dir: Path,
     frame_count: int,
     duration_ms: int,
+    target_duration_ms: int | None = None,
 ) -> list[Path]:
     green_reference_url = create_green_screen_reference(image_url, output_dir)
     public_image_url = static_url_to_public_url(green_reference_url)
@@ -230,5 +433,10 @@ def generate_wan_animation_gif(
         frame_paths=frame_paths,
         fps=float(os.getenv("WAN_GIF_FPS", "12")),
         duration_ms=duration_ms,
+        target_duration_ms=(
+            target_duration_ms
+            if target_duration_ms is not None
+            else int(os.getenv("WAN_GIF_DURATION_MS", str(DEFAULT_WAN_GIF_DURATION_MS)))
+        ),
         max_frames=None,
     )

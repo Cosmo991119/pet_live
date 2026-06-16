@@ -14,6 +14,8 @@ from typing import Any, Optional
 import requests
 from dotenv import load_dotenv
 
+from pet_message_agent import format_speaker_labeled_message
+
 
 class Notifier(ABC):
     """Base interface for message delivery channels."""
@@ -98,11 +100,13 @@ def notify_event_message(
 ) -> None:
     """Send a structured event-message result through a notifier."""
     message = message_result["message"]
+    pet_name = str(message_result.get("pet_name") or "").strip()
     notifier.send(
         pet_id=pet_id,
-        message=message["message"],
+        message=format_speaker_labeled_message(message["message"], pet_name),
         severity=message.get("severity", "normal"),
         metadata={
+            "pet_name": pet_name,
             "facts_used": message.get("facts_used", []),
             "internal_signal": message.get("internal_signal"),
             "model_name": message_result.get("model_name"),
